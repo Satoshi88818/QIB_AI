@@ -1,0 +1,43 @@
+cd /home/squire/qib
+cat > /tmp/mutate.py <<'EOF'
+import subprocess, sys, shutil, re
+MUTS = {
+ "M1 probe-pass always true (v17 sentinel bug)": ("src/verifier.rs", "let passed = p.actual_fidelity >= PROBE_PASS_THRESHOLD;", "let passed = p.actual_fidelity >= 0.0;"),
+ "M2 phantom -1.0 global std sum (v17 bug)": ("src/twin.rs", "            self.std_sum += st.contrib;\n", ""),
+ "M3 cache key ignores safety version": ("src/verifier.rs", "safety_version: view.version,", "safety_version: 0,"),
+ "M4 cache hit not revalidated AND key ignores version": ("src/verifier.rs", "if !(c.is_finite() && c >= 0.0) {\n                    return Ok(None);\n                }", "if false {\n                    return Ok(None);\n                }"),
+ "M5 hard reject cap removed": ("src/config.rs", "pub const HARD_PATH_REJECT_CAP: f64 = 0.20;", "pub const HARD_PATH_REJECT_CAP: f64 = 1.0;"),
+ "M6 quarantine no longer forces INFINITY": ("src/hop_cost.rs", "    if i.quarantined {\n        return f64::INFINITY;\n    }\n    match", "    match"),
+ "M7 std collapses as 1/sqrt(n) (v17 semantics)": ("src/twin.rs", "let sd = (var * (1.0 + 1.0 / n_eff)).sqrt();", "let sd = (var / (self.n as f64 - 1.0).max(1.0)).sqrt();"),
+ "M8 breaker latch removed from advance()": ("src/breaker.rs", "    fn advance(&mut self, reason: &str, ev: &mut Vec<AuditEvent>) -> bool {\n        if !self.ai_enabled {\n            return false;\n        }", "    fn advance(&mut self, reason: &str, ev: &mut Vec<AuditEvent>) -> bool {"),
+ "M9 audit hash ignores event body": ("src/audit.rs", 'h.update(format!("{seq}|{ts}|{prev}|{ev}").as_bytes());', 'let _ = &ev; h.update(format!("{seq}|{ts}|{prev}").as_bytes());'),
+ "M10 probe nonce replay check removed": ("src/sentinel.rs", "if seen.contains_key(&p.nonce) {", "if false {"),
+ "M11 NaN observation accepted (clamp instead of reject)": ("src/twin.rs", "if !(x.is_finite() && (0.0..=1.0).contains(&x)) {\n            return Err(VerifierError::InvalidObservation(x));\n        }\n        let mut g = self.w()?;\n        let std_before", "let x = x.clamp(0.0, 1.0);\n        let mut g = self.w()?;\n        let std_before"),
+ "M12 zone threshold capped by unrelated setting (v17 bug)": ("src/verifier.rs", "cfg.zone_quarantine_link_threshold)? {", "cfg.zone_quarantine_link_threshold.max(4))? {"),
+ "M13 safe mode ignores quarantine": ("src/hop_cost.rs", "if quarantined || !(static_weight.is_finite() && static_weight > 0.0) {", "if !(static_weight.is_finite() && static_weight > 0.0) {"),
+ "M14 drift hysteresis removed (re-fires every flap)": ("src/drift.rs", "if s.ewma > thr && s.armed {", "if s.ewma > thr {"),
+ "M15 audit failure no longer blocks operator reset": ("src/breaker.rs", "self.audit.append(&AuditEvent::HumanReset { operator: operator.to_owned() })?;", "let _ = self.audit.append(&AuditEvent::HumanReset { operator: operator.to_owned() });"),
+}
+sel = sys.argv[1:]
+for name,(path,old,new) in MUTS.items():
+    if sel and name.split()[0] not in sel: continue
+    src=open(path).read()
+    if old not in src:
+        print(f"{name}: PATTERN NOT FOUND"); continue
+    open(path,'w').write(src.replace(old,new,1))
+    try:
+        r=subprocess.run("cargo test --offline --no-fail-fast 2>&1",shell=True,capture_output=True,text=True,timeout=600)
+        out=r.stdout
+        if "error[" in out or "error: could not compile" in out:
+            print(f"{name}: COMPILE ERROR"); 
+        else:
+            failed=sorted(set(re.findall(r"^test (\S+) \.\.\. FAILED",out,re.M)))
+            print(f"{name}: {'KILLED' if failed else 'SURVIVED !!'} ({len(failed)} failing: {', '.join(f.split('::')[-1] for f in failed[:3])}{'…' if len(failed)>3 else ''})")
+    finally:
+        open(path,'w').write(src)
+EOF
+python3 /tmp/mutate.py M1 M2 M3 M4 M5 2>&1 | tail -12
+
+Response:
+
+{"returncode":0,"stdout":"M1 probe-pass always true (v17 sentinel bug): KILLED (7 failing: audit_file_chain_survives_a_full_incident, failed_probe_on_a_link_the_ai_already_distrusts_does_not_quarantine, failed_probe_on_a_link_the_ai_trusts_quarantines_it…)\nM2 phantom -1.0 global std sum (v17 bug): KILLED (5 failing: health_is_read_only_and_reflects_reality, global_avg_std_counts_links_created_by_quarantine, global_avg_std_is_not_stuck_at_zero…)\nM3 cache key ignores safety version: KILLED (1 failing: cached_routes_never_survive_a_quarantine)\nM4 cache hit not revalidated AND key ignores version: KILLED (1 failing: cache_hit_is_revalidated_even_if_the_version_was_not_bumped)\nM5 hard reject cap removed: KILLED (3 failing: reject_threshold_above_hard_cap_is_refused, reload_invalid_keeps_old_config, config_reload_is_validated_audited_and_changes_behaviour)\n","stderr":""}
