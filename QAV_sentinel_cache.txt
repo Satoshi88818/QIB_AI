@@ -1,0 +1,239 @@
+cd /home/squire/qib
+python3 - <<'EOF'
+import re
+p='src/graph.rs'
+s=open(p).read()
+s=s.replace('''assert!((total - 8.0).abs() < 1e-9, "S-A-T (3) + S-B-T (3) = 6? got {total}");''','''assert!((total - 6.0).abs() < 1e-9, "S-A-T (3) + S-B-T (3) = 6, got {total}");''')
+open(p,'w').write(s)
+
+p='src/sentinel.rs'
+s=open(p).read()
+old=s[s.index("    #[test]\n    fn every_signed_field_is_tamper_evident"):s.index("    #[test]\n    fn field_boundary_ambiguity_is_closed")]
+new='''    #[test]
+    fn every_signed_field_is_tamper_evident() {
+        let v = pv();
+        let good = SignedProbe::sign(&sk(1), "A", "B", 0.5, 1, NOW);
+        let check = |p: SignedProbe| {
+            assert!(v.verify(&p, NOW, AGE, 100).is_err(), "tampered probe accepted");
+        };
+        check(SignedProbe { actual_fidelity: 0.99, ..good.clone() });
+        check(SignedProbe { src: "Z".into(), ..good.clone() });
+        check(SignedProbe { dst: "Z".into(), ..good.clone() });
+        check(SignedProbe { nonce: 2, ..good.clone() });
+        check(SignedProbe { timestamp_ms: NOW + 1, ..good.clone() });
+        let mut s = good.clone();
+        s.signature[0] ^= 1;
+        check(s);
+        // tampered probes must not burn the legitimate nonce
+        v.verify(&good, NOW, AGE, 100).unwrap();
+    }
+
+'''
+s=s.replace(old,new)
+open(p,'w').write(s)
+
+# config: prepare/commit
+p='src/config.rs'
+s=open(p).read()
+old=s[s.index("    /// Parse + validate + swap."):s.index("    pub fn reload_from_path")]
+new='''    /// Phase 1: parse + validate without changing anything. Returns the candidate
+    /// config and the names of the fields that would change.
+    pub fn prepare(&self, toml_text: &str) -> Result<(RuntimeConfig, Vec<String>)> {
+        let new: RuntimeConfig =
+            toml::from_str(toml_text).map_err(|e| VerifierError::Config(e.to_string()))?;
+        new.validate()?;
+        let changed = changed_fields(&self.get(), &new)?;
+        Ok((new, changed))
+    }
+
+    /// Phase 2: swap in a prepared config (re-validated defensively).
+    pub fn commit(&self, new: RuntimeConfig) -> Result<()> {
+        new.validate()?;
+        let mut w = self.current.write().map_err(|_| VerifierError::LockPoisoned)?;
+        *w = Arc::new(new);
+        self.version.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Parse + validate + swap. On any failure the old config stays in force.
+    /// Returns the names of the fields that changed.
+    pub fn reload_from_str(&self, toml_text: &str) -> Result<Vec<String>> {
+        let (new, changed) = self.prepare(toml_text)?;
+        if !changed.is_empty() {
+            self.commit(new)?;
+        }
+        Ok(changed)
+    }
+
+'''
+s=s.replace(old,new)
+open(p,'w').write(s)
+
+# breaker: emit_event
+p='src/breaker.rs'
+s=open(p).read()
+s=s.replace('''    pub fn audit_failures(&self) -> u64 {''','''    /// Best-effort audit of an event raised outside this module (counted on failure).
+    pub fn emit_event(&self, event: AuditEvent) {
+        self.emit(vec![event]);
+    }
+
+    pub fn audit_failures(&self) -> u64 {''',1)
+open(p,'w').write(s)
+EOF
+cat > src/cache.rs <<'EOF'
+//! Routing cache: bounded (LRU) + TTL.
+//!
+//! The key includes the safety-state version and config version, so any
+//! quarantine / breaker / conservative / stage / config / gate-class change makes
+//! old entries unreachable. v17 keyed only on (src,dst,k,graph,ai_enabled), so a
+//! freshly quarantined link could keep being routed for the whole 5 s TTL.
+//! The router additionally re-validates every hit (defence in depth).
+use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RouteMode {
+    Ai,
+    AiConservative,
+    Safe,
+    /// AI mode found no admissible path, so the static safe path was used.
+    SafeFallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CacheKey {
+    pub src: usize,
+    pub dst: usize,
+    pub k: usize,
+    pub graph_id: u64,
+    pub ai_enabled: bool,
+    pub conservative: bool,
+    pub diverse: bool,
+    pub safety_version: u64,
+    pub cfg_version: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    /// Edge-index lists, one per path.
+    pub paths: Vec<Vec<usize>>,
+    pub mode: RouteMode,
+    inserted_ns: u64,
+    last_used: u64,
+}
+
+pub struct RouteCache {
+    map: HashMap<CacheKey, CacheEntry>,
+    tick: u64,
+}
+
+impl Default for RouteCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RouteCache {
+    pub fn new() -> Self {
+        Self { map: HashMap::new(), tick: 0 }
+    }
+
+    pub fn get(&mut self, key: &CacheKey, now_ns: u64, ttl_ms: u64) -> Option<CacheEntry> {
+        self.tick += 1;
+        let tick = self.tick;
+        let expired = match self.map.get_mut(key) {
+            None => return None,
+            Some(e) => {
+                if now_ns.saturating_sub(e.inserted_ns) > ttl_ms.saturating_mul(1_000_000) {
+                    true
+                } else {
+                    e.last_used = tick;
+                    return Some(e.clone());
+                }
+            }
+        };
+        if expired {
+            self.map.remove(key);
+        }
+        None
+    }
+
+    pub fn remove(&mut self, key: &CacheKey) {
+        self.map.remove(key);
+    }
+
+    pub fn put(&mut self, key: CacheKey, paths: Vec<Vec<usize>>, mode: RouteMode, now_ns: u64, capacity: usize) {
+        self.tick += 1;
+        // Drop entries for superseded state versions first; they can never be hit again.
+        let (sv, cv) = (key.safety_version, key.cfg_version);
+        self.map.retain(|k, _| k.safety_version >= sv && k.cfg_version >= cv);
+        while self.map.len() >= capacity.max(1) {
+            let lru = self.map.iter().min_by_key(|(_, e)| e.last_used).map(|(k, _)| k.clone());
+            match lru {
+                Some(k) => {
+                    self.map.remove(&k);
+                }
+                None => break,
+            }
+        }
+        self.map.insert(key, CacheEntry { paths, mode, inserted_ns: now_ns, last_used: self.tick });
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(src: usize, sv: u64) -> CacheKey {
+        CacheKey { src, dst: 9, k: 1, graph_id: 1, ai_enabled: true, conservative: false, diverse: false, safety_version: sv, cfg_version: 1 }
+    }
+
+    #[test]
+    fn ttl_expiry() {
+        let mut c = RouteCache::new();
+        c.put(key(0, 0), vec![vec![1]], RouteMode::Ai, 0, 10);
+        assert!(c.get(&key(0, 0), 4_999_999_000 / 1000, 5).is_some());
+        assert!(c.get(&key(0, 0), 5_000_001 * 1000, 5).is_none());
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn lru_eviction_keeps_recently_used() {
+        let mut c = RouteCache::new();
+        for i in 0..3 {
+            c.put(key(i, 0), vec![], RouteMode::Ai, 0, 3);
+        }
+        assert!(c.get(&key(0, 0), 0, 5).is_some()); // touch 0 => 1 is now LRU
+        c.put(key(3, 0), vec![], RouteMode::Ai, 0, 3);
+        assert_eq!(c.len(), 3);
+        assert!(c.get(&key(1, 0), 0, 5).is_none());
+        assert!(c.get(&key(0, 0), 0, 5).is_some());
+    }
+
+    #[test]
+    fn different_safety_version_is_a_different_key() {
+        let mut c = RouteCache::new();
+        c.put(key(0, 1), vec![vec![1]], RouteMode::Ai, 0, 10);
+        assert!(c.get(&key(0, 2), 0, 5).is_none());
+    }
+
+    #[test]
+    fn superseded_versions_are_purged() {
+        let mut c = RouteCache::new();
+        c.put(key(0, 1), vec![], RouteMode::Ai, 0, 10);
+        c.put(key(1, 2), vec![], RouteMode::Ai, 0, 10);
+        assert_eq!(c.len(), 1);
+    }
+}
+EOF
+echo ok
+
+Response:
+
+{"returncode":0,"stdout":"ok\n","stderr":""}
