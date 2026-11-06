@@ -1,0 +1,676 @@
+cd /home/squire/qib
+cat > src/hop_cost.rs <<'EOF'
+//! Pure hop-cost functions. These are the *real* functions used by the router
+//! and called directly by the property tests (v17's proofs re-implemented the
+//! logic inline, so they proved a copy rather than the code).
+use crate::config::{RuntimeConfig, HOP_COST_FLOOR};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HopInputs {
+    pub mean: f64,
+    pub std: f64,
+    pub quarantined: bool,
+}
+
+impl HopInputs {
+    /// Inputs for a link the twin has never seen: maximum uncertainty.
+    pub const UNKNOWN: HopInputs = HopInputs { mean: 0.0, std: 1.0, quarantined: false };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CostParams {
+    pub tax_threshold: f64,
+    pub reject_threshold: f64,
+    pub tax_multiplier: f64,
+}
+
+impl CostParams {
+    pub fn standard(c: &RuntimeConfig) -> Self {
+        Self {
+            tax_threshold: c.safety_tax_threshold,
+            reject_threshold: c.path_reject_threshold,
+            tax_multiplier: c.safety_tax_multiplier,
+        }
+    }
+    pub fn conservative(c: &RuntimeConfig) -> Self {
+        Self {
+            tax_threshold: c.safety_tax_threshold,
+            reject_threshold: c.conservative_reject_threshold,
+            tax_multiplier: c.conservative_tax_multiplier,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateClass {
+    Clear,
+    Taxed,
+    Rejected,
+}
+
+/// Classify a link's uncertainty. Anything non-finite is rejected (fail closed).
+pub fn gate_class(i: &HopInputs, p: &CostParams) -> GateClass {
+    if !(i.std.is_finite() && i.std >= 0.0 && i.mean.is_finite()) || i.std > p.reject_threshold {
+        GateClass::Rejected
+    } else if i.std > p.tax_threshold {
+        GateClass::Taxed
+    } else {
+        GateClass::Clear
+    }
+}
+
+/// AI-mode hop cost. `f64::INFINITY` means "never route over this link".
+/// Quarantine beats everything, regardless of std.
+pub fn hop_cost(i: &HopInputs, p: &CostParams) -> f64 {
+    if i.quarantined {
+        return f64::INFINITY;
+    }
+    match gate_class(i, p) {
+        GateClass::Rejected => f64::INFINITY,
+        GateClass::Taxed => ((1.0 - i.mean.clamp(0.0, 1.0)) + HOP_COST_FLOOR) * p.tax_multiplier,
+        GateClass::Clear => (1.0 - i.mean.clamp(0.0, 1.0)) + HOP_COST_FLOOR,
+    }
+}
+
+/// Safe-mode hop cost: static topology weight, but quarantine still applies.
+pub fn safe_hop_cost(static_weight: f64, quarantined: bool) -> f64 {
+    if quarantined || !(static_weight.is_finite() && static_weight > 0.0) {
+        f64::INFINITY
+    } else {
+        static_weight
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn params() -> (CostParams, CostParams) {
+        let c = RuntimeConfig::default();
+        (CostParams::standard(&c), CostParams::conservative(&c))
+    }
+
+    fn any_f64() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            4 => 0.0f64..=1.0,
+            1 => Just(f64::NAN),
+            1 => Just(f64::INFINITY),
+            1 => Just(f64::NEG_INFINITY),
+            1 => -10.0f64..10.0,
+        ]
+    }
+
+    proptest! {
+        /// J: a quarantined link is INFINITY for every mean/std, including NaN.
+        #[test]
+        fn quarantined_is_always_infinite(mean in any_f64(), std in any_f64()) {
+            let (s, c) = params();
+            let i = HopInputs { mean, std, quarantined: true };
+            prop_assert!(hop_cost(&i, &s).is_infinite());
+            prop_assert!(hop_cost(&i, &c).is_infinite());
+        }
+
+        /// G: std above the reject threshold is INFINITY.
+        #[test]
+        fn high_std_is_rejected(mean in 0.0f64..=1.0, std in 0.1500001f64..=1.0) {
+            let (s, _) = params();
+            prop_assert!(hop_cost(&HopInputs { mean, std, quarantined: false }, &s).is_infinite());
+        }
+
+        /// Output is never NaN and never negative, for any input at all.
+        #[test]
+        fn cost_is_never_nan_or_negative(mean in any_f64(), std in any_f64(), q in any::<bool>()) {
+            let (s, c) = params();
+            for p in [&s, &c] {
+                let x = hop_cost(&HopInputs { mean, std, quarantined: q }, p);
+                prop_assert!(!x.is_nan());
+                prop_assert!(x >= 0.0);
+            }
+        }
+
+        /// F: for fixed std, a higher mean never costs more.
+        #[test]
+        fn monotone_in_mean(a in 0.0f64..=1.0, b in 0.0f64..=1.0, std in 0.0f64..=0.2) {
+            let (s, _) = params();
+            let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+            let ch = hop_cost(&HopInputs { mean: hi, std, quarantined: false }, &s);
+            let cl = hop_cost(&HopInputs { mean: lo, std, quarantined: false }, &s);
+            prop_assert!(ch <= cl);
+        }
+
+        /// Missing from v17: for fixed mean, more uncertainty never costs less.
+        #[test]
+        fn monotone_in_std(mean in 0.0f64..=1.0, a in 0.0f64..=0.3, b in 0.0f64..=0.3) {
+            let (s, c) = params();
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            for p in [&s, &c] {
+                let cl = hop_cost(&HopInputs { mean, std: lo, quarantined: false }, p);
+                let ch = hop_cost(&HopInputs { mean, std: hi, quarantined: false }, p);
+                prop_assert!(ch >= cl);
+            }
+        }
+
+        /// M (strengthened): conservative never cheaper than standard, and it
+        /// rejects a superset of what standard rejects.
+        #[test]
+        fn conservative_dominates_standard(mean in 0.0f64..=1.0, std in 0.0f64..=1.0, q in any::<bool>()) {
+            let (s, c) = params();
+            let i = HopInputs { mean, std, quarantined: q };
+            let (cs, cc) = (hop_cost(&i, &s), hop_cost(&i, &c));
+            prop_assert!(cc >= cs);
+            if cs.is_infinite() { prop_assert!(cc.is_infinite()); }
+        }
+
+        /// Safe mode still honours quarantine.
+        #[test]
+        fn safe_mode_honours_quarantine(w in 0.001f64..100.0) {
+            prop_assert!(safe_hop_cost(w, true).is_infinite());
+            prop_assert_eq!(safe_hop_cost(w, false), w);
+        }
+    }
+
+    #[test]
+    fn unknown_link_is_rejected_in_ai_mode() {
+        let (s, _) = params();
+        assert!(hop_cost(&HopInputs::UNKNOWN, &s).is_infinite());
+    }
+
+    #[test]
+    fn tax_applies_between_thresholds() {
+        let (s, _) = params();
+        let clear = hop_cost(&HopInputs { mean: 0.9, std: 0.01, quarantined: false }, &s);
+        let taxed = hop_cost(&HopInputs { mean: 0.9, std: 0.10, quarantined: false }, &s);
+        assert!((taxed / clear - 2.5).abs() < 1e-9);
+    }
+}
+EOF
+cat > src/twin.rs <<'EOF'
+//! IMP-P: probabilistic twin (time-decayed Gaussian per directed link).
+//!
+//! Fixes vs v17:
+//! * Global uncertainty stats are maintained as `sum == Σ per-link contribution`
+//!   under one lock; v17's incremental sum subtracted a phantom 1.0 for every new
+//!   link and collapsed to ~0, blinding the spike detector and health score.
+//! * `uncertainty` no longer shrinks as 1/√n: it is the *predictive* std of a
+//!   decay-weighted Gaussian, so a link that turns flaky stays visibly uncertain.
+//! * Non-finite / out-of-range observations are rejected, not clamped (clamp
+//!   propagates NaN).
+//! * Link keys are `(src, dst)` pairs, not `"src→dst"` strings.
+//! * Getters never create entries.
+use crate::config::{MIN_SAMPLES_FOR_CONFIDENCE};
+use crate::errors::{Result, VerifierError};
+use crate::hop_cost::HopInputs;
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::RwLock;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LinkId {
+    pub src: String,
+    pub dst: String,
+}
+
+impl LinkId {
+    pub fn new(src: &str, dst: &str) -> Self {
+        Self { src: src.to_owned(), dst: dst.to_owned() }
+    }
+}
+
+impl fmt::Display for LinkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}->{}", self.src, self.dst)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LinkState {
+    mean: f64,
+    /// Decay-weighted sum of squared deviations.
+    s: f64,
+    /// Σ weights, Σ weights² (for effective sample size).
+    w: f64,
+    w2: f64,
+    n: u64,
+    quarantined: bool,
+    quarantine_reason: Option<String>,
+    brier_ew: f64,
+    brier_n: u64,
+    /// This link's current contribution to the global std sum.
+    contrib: f64,
+}
+
+impl LinkState {
+    fn fresh() -> Self {
+        Self {
+            mean: 0.0,
+            s: 0.0,
+            w: 0.0,
+            w2: 0.0,
+            n: 0,
+            quarantined: false,
+            quarantine_reason: None,
+            brier_ew: 0.0,
+            brier_n: 0,
+            contrib: 1.0, // matches std() of a fresh link, and is added to the sum on insert
+        }
+    }
+
+    /// Predictive std. 1.0 (maximum uncertainty) until enough samples exist.
+    fn std(&self) -> f64 {
+        if self.n < MIN_SAMPLES_FOR_CONFIDENCE || !(self.w > 0.0 && self.w2 > 0.0) {
+            return 1.0;
+        }
+        let var = (self.s / self.w).max(0.0);
+        let n_eff = (self.w * self.w) / self.w2;
+        let sd = (var * (1.0 + 1.0 / n_eff)).sqrt();
+        if sd.is_finite() {
+            sd.min(1.0)
+        } else {
+            1.0
+        }
+    }
+
+    fn update(&mut self, x: f64, decay_alpha: f64) {
+        let d = 1.0 - decay_alpha;
+        self.w = self.w * d + 1.0;
+        self.w2 = self.w2 * d * d + 1.0;
+        self.s *= d;
+        let delta = x - self.mean;
+        self.mean += delta / self.w;
+        self.s += delta * (x - self.mean);
+        if self.s < 0.0 {
+            self.s = 0.0; // fp noise
+        }
+        self.n += 1;
+    }
+
+    fn brier(&self, window: u64) -> Option<f64> {
+        (self.brier_n >= window).then_some(self.brier_ew)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkSnapshot {
+    pub mean: f64,
+    pub std: f64,
+    pub samples: u64,
+    pub quarantined: bool,
+    pub brier: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObserveResult {
+    pub std_before: f64,
+    pub snapshot: LinkSnapshot,
+}
+
+#[derive(Default)]
+struct Inner {
+    links: HashMap<LinkId, LinkState>,
+    std_sum: f64,
+    ops: u64,
+}
+
+impl Inner {
+    fn entry(&mut self, link: &LinkId) -> &mut LinkState {
+        if !self.links.contains_key(link) {
+            let st = LinkState::fresh();
+            self.std_sum += st.contrib;
+            self.links.insert(link.clone(), st);
+        }
+        // Just ensured present; the fallback arm is unreachable but avoids unwrap.
+        self.links.entry(link.clone()).or_insert_with(LinkState::fresh)
+    }
+
+    fn recompute_sum(&mut self) {
+        self.std_sum = self.links.values().map(|s| s.contrib).sum();
+    }
+}
+
+fn snap(s: &LinkState, brier_window: u64) -> LinkSnapshot {
+    LinkSnapshot {
+        mean: s.mean,
+        std: s.std(),
+        samples: s.n,
+        quarantined: s.quarantined,
+        brier: s.brier(brier_window),
+    }
+}
+
+pub struct TwinStore {
+    inner: RwLock<Inner>,
+}
+
+impl Default for TwinStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const RECOMPUTE_EVERY: u64 = 1024;
+
+impl TwinStore {
+    pub fn new() -> Self {
+        Self { inner: RwLock::new(Inner::default()) }
+    }
+
+    fn w(&self) -> Result<std::sync::RwLockWriteGuard<'_, Inner>> {
+        self.inner.write().map_err(|_| VerifierError::LockPoisoned)
+    }
+    fn r(&self) -> Result<std::sync::RwLockReadGuard<'_, Inner>> {
+        self.inner.read().map_err(|_| VerifierError::LockPoisoned)
+    }
+
+    pub fn observe(&self, link: &LinkId, x: f64, decay_alpha: f64, brier_window: u64) -> Result<ObserveResult> {
+        if !(x.is_finite() && (0.0..=1.0).contains(&x)) {
+            return Err(VerifierError::InvalidObservation(x));
+        }
+        let mut g = self.w()?;
+        let std_before = g.entry(link).std();
+        let (new_std, snapshot) = {
+            let st = g.entry(link);
+            st.update(x, decay_alpha);
+            let ns = st.std();
+            (ns, snap(st, brier_window))
+        };
+        let old_contrib = {
+            let st = g.entry(link);
+            let o = st.contrib;
+            st.contrib = new_std;
+            o
+        };
+        g.std_sum += new_std - old_contrib;
+        g.ops += 1;
+        if g.ops % RECOMPUTE_EVERY == 0 {
+            g.recompute_sum(); // bound floating-point drift
+        }
+        Ok(ObserveResult { std_before, snapshot })
+    }
+
+    /// Record a prediction-vs-reality comparison. Returns `(delta, predicted_mean)`.
+    pub fn compare(&self, link: &LinkId, actual: f64, brier_window: u64) -> Result<(f64, f64)> {
+        if !(actual.is_finite() && (0.0..=1.0).contains(&actual)) {
+            return Err(VerifierError::InvalidObservation(actual));
+        }
+        let mut g = self.w()?;
+        let st = g
+            .links
+            .get_mut(link)
+            .filter(|s| s.n > 0)
+            .ok_or_else(|| VerifierError::UnknownLink(link.to_string()))?;
+        let predicted = st.mean;
+        let err2 = (predicted - actual).powi(2);
+        st.brier_n += 1;
+        let a = (1.0 / brier_window.max(1) as f64).max(1.0 / st.brier_n as f64);
+        st.brier_ew += a * (err2 - st.brier_ew);
+        Ok(((predicted - actual).abs(), predicted))
+    }
+
+    /// Read-only; never inserts.
+    pub fn snapshot(&self, link: &LinkId, brier_window: u64) -> Result<Option<LinkSnapshot>> {
+        Ok(self.r()?.links.get(link).map(|s| snap(s, brier_window)))
+    }
+
+    pub fn predicted_mean(&self, link: &LinkId) -> Result<Option<f64>> {
+        Ok(self.r()?.links.get(link).filter(|s| s.n > 0).map(|s| s.mean))
+    }
+
+    pub fn is_quarantined(&self, link: &LinkId) -> Result<bool> {
+        Ok(self.r()?.links.get(link).map_or(false, |s| s.quarantined))
+    }
+
+    /// Set/clear quarantine. Returns true if the state changed. Creates the link
+    /// (at maximum uncertainty) if unknown so the quarantine cannot be lost.
+    pub fn set_quarantined(&self, link: &LinkId, value: bool, reason: &str) -> Result<bool> {
+        let mut g = self.w()?;
+        let st = g.entry(link);
+        if st.quarantined == value {
+            return Ok(false);
+        }
+        st.quarantined = value;
+        st.quarantine_reason = if value { Some(reason.to_owned()) } else { None };
+        Ok(true)
+    }
+
+    pub fn quarantine_reason(&self, link: &LinkId) -> Result<Option<String>> {
+        Ok(self.r()?.links.get(link).and_then(|s| s.quarantine_reason.clone()))
+    }
+
+    /// Hop-cost inputs for many links under ONE read lock (consistent snapshot).
+    pub fn hop_inputs_bulk<'a, I: IntoIterator<Item = &'a LinkId>>(&self, links: I) -> Result<Vec<HopInputs>> {
+        let g = self.r()?;
+        Ok(links
+            .into_iter()
+            .map(|l| match g.links.get(l) {
+                Some(s) => HopInputs { mean: s.mean, std: s.std(), quarantined: s.quarantined },
+                None => HopInputs::UNKNOWN,
+            })
+            .collect())
+    }
+
+    /// O(1) mean std across tracked links. Unknown-to-twin ⇒ 1.0.
+    pub fn global_avg_std(&self) -> Result<f64> {
+        let g = self.r()?;
+        if g.links.is_empty() {
+            return Ok(1.0);
+        }
+        Ok((g.std_sum / g.links.len() as f64).clamp(0.0, 1.0))
+    }
+
+    pub fn len(&self) -> Result<usize> {
+        Ok(self.r()?.links.len())
+    }
+
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    pub fn quarantine_fraction(&self) -> Result<f64> {
+        let g = self.r()?;
+        if g.links.is_empty() {
+            return Ok(0.0);
+        }
+        Ok(g.links.values().filter(|s| s.quarantined).count() as f64 / g.links.len() as f64)
+    }
+
+    pub fn quarantined_links(&self) -> Result<Vec<LinkId>> {
+        let mut v: Vec<LinkId> = self.r()?.links.iter().filter(|(_, s)| s.quarantined).map(|(k, _)| k.clone()).collect();
+        v.sort();
+        Ok(v)
+    }
+
+    pub fn all_links(&self) -> Result<Vec<LinkId>> {
+        let mut v: Vec<LinkId> = self.r()?.links.keys().cloned().collect();
+        v.sort();
+        Ok(v)
+    }
+
+    /// Worst-N links by std descending (ties broken by id for determinism).
+    pub fn top_n_worst(&self, n: usize) -> Result<Vec<(LinkId, f64)>> {
+        let g = self.r()?;
+        let mut v: Vec<(LinkId, f64)> = g.links.iter().map(|(k, s)| (k.clone(), s.std())).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.truncate(n);
+        Ok(v)
+    }
+
+    pub fn any_calibration_drift(&self, threshold: f64, window: u64) -> Result<bool> {
+        Ok(self.r()?.links.values().any(|s| s.brier(window).map_or(false, |b| b > threshold)))
+    }
+
+    /// Test/diagnostic: does the incremental sum equal the exact sum?
+    pub fn std_sum_drift(&self) -> Result<f64> {
+        let g = self.r()?;
+        let exact: f64 = g.links.values().map(|s| s.contrib).sum();
+        Ok((exact - g.std_sum).abs())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn l(a: &str, b: &str) -> LinkId {
+        LinkId::new(a, b)
+    }
+
+    #[test]
+    fn global_avg_std_is_not_stuck_at_zero() {
+        // Regression (v17 bug 2): phantom -1.0 per new link pinned the sum at 0.
+        let t = TwinStore::new();
+        // Alternating fidelity => genuinely uncertain links.
+        for i in 0..40 {
+            for (a, b) in [("A", "B"), ("B", "C"), ("C", "D")] {
+                let x = if i % 2 == 0 { 0.95 } else { 0.55 };
+                t.observe(&l(a, b), x, 0.05, 100).unwrap();
+            }
+        }
+        let g = t.global_avg_std().unwrap();
+        assert!(g > 0.1, "global avg std should reflect noisy links, got {g}");
+        assert!(t.std_sum_drift().unwrap() < 1e-9);
+    }
+
+    #[test]
+    fn global_avg_std_counts_links_created_by_quarantine() {
+        let t = TwinStore::new();
+        t.set_quarantined(&l("X", "Y"), true, "test").unwrap();
+        assert_eq!(t.len().unwrap(), 1);
+        assert!((t.global_avg_std().unwrap() - 1.0).abs() < 1e-12);
+        assert!(t.std_sum_drift().unwrap() < 1e-12);
+        t.observe(&l("X", "Y"), 0.9, 0.05, 100).unwrap();
+        assert!(t.std_sum_drift().unwrap() < 1e-12);
+    }
+
+    #[test]
+    fn std_does_not_collapse_for_a_flaky_link() {
+        // Regression: v17 divided by (n-1) so std -> 0 as n grew.
+        let t = TwinStore::new();
+        let k = l("A", "B");
+        let mut last = 0.0;
+        for i in 0..5000 {
+            let x = if i % 2 == 0 { 0.95 } else { 0.35 };
+            last = t.observe(&k, x, 0.05, 100).unwrap().snapshot.std;
+        }
+        assert!(last > 0.15, "flaky link must stay above the reject threshold, got {last}");
+    }
+
+    #[test]
+    fn stable_link_becomes_confident() {
+        let t = TwinStore::new();
+        let k = l("A", "B");
+        let mut r = t.observe(&k, 0.97, 0.05, 100).unwrap();
+        assert_eq!(r.snapshot.std, 1.0); // < MIN_SAMPLES => max uncertainty
+        for _ in 0..30 {
+            r = t.observe(&k, 0.97, 0.05, 100).unwrap();
+        }
+        assert!(r.snapshot.std < 0.01);
+        assert!((r.snapshot.mean - 0.97).abs() < 1e-9);
+    }
+
+    #[test]
+    fn identical_early_samples_do_not_fake_confidence() {
+        let t = TwinStore::new();
+        let k = l("A", "B");
+        for _ in 0..4 {
+            assert_eq!(t.observe(&k, 0.99, 0.05, 100).unwrap().snapshot.std, 1.0);
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_and_out_of_range() {
+        let t = TwinStore::new();
+        let k = l("A", "B");
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01, 1.01] {
+            assert!(matches!(t.observe(&k, bad, 0.05, 100), Err(VerifierError::InvalidObservation(_))));
+            assert!(matches!(t.compare(&k, bad, 100), Err(VerifierError::InvalidObservation(_))));
+        }
+        assert_eq!(t.len().unwrap(), 0, "rejected observations must not create state");
+    }
+
+    #[test]
+    fn getters_never_insert() {
+        let t = TwinStore::new();
+        let k = l("A", "B");
+        assert!(t.snapshot(&k, 100).unwrap().is_none());
+        assert!(t.predicted_mean(&k).unwrap().is_none());
+        assert!(!t.is_quarantined(&k).unwrap());
+        assert!(t.compare(&k, 0.5, 100).is_err());
+        assert_eq!(t.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn link_ids_with_arrow_characters_do_not_collide() {
+        let t = TwinStore::new();
+        t.observe(&l("a→b", "c"), 0.9, 0.05, 100).unwrap();
+        t.observe(&l("a", "b→c"), 0.5, 0.05, 100).unwrap();
+        assert_eq!(t.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn calibration_drift_detected_after_window() {
+        let t = TwinStore::new();
+        let k = l("A", "B");
+        for _ in 0..10 {
+            t.observe(&k, 0.99, 0.05, 20).unwrap();
+        }
+        for _ in 0..19 {
+            t.compare(&k, 0.1, 20).unwrap();
+        }
+        assert!(!t.any_calibration_drift(0.25, 20).unwrap(), "window not yet full");
+        t.compare(&k, 0.1, 20).unwrap();
+        assert!(t.any_calibration_drift(0.25, 20).unwrap());
+    }
+
+    #[test]
+    fn top_n_is_sorted_and_deterministic() {
+        let t = TwinStore::new();
+        t.set_quarantined(&l("B", "C"), true, "x").unwrap(); // std 1.0
+        for _ in 0..10 {
+            t.observe(&l("A", "B"), 0.9, 0.05, 100).unwrap(); // std ~0
+        }
+        let v = t.top_n_worst(5).unwrap();
+        assert_eq!(v[0].0, l("B", "C"));
+        assert_eq!(v.len(), 2);
+    }
+
+    proptest! {
+        /// Kani-A analogue on the real code: variance/std are finite and >= 0 for
+        /// any accepted observation sequence and any legal decay.
+        #[test]
+        fn std_always_finite_nonneg(obs in proptest::collection::vec(0.0f64..=1.0, 1..200), decay in 0.0f64..=0.5) {
+            let t = TwinStore::new();
+            let k = l("A", "B");
+            for x in obs {
+                let r = t.observe(&k, x, decay, 100).unwrap();
+                prop_assert!(r.snapshot.std.is_finite());
+                prop_assert!((0.0..=1.0).contains(&r.snapshot.std));
+                prop_assert!(r.snapshot.mean.is_finite() && (-1e-9..=1.0 + 1e-9).contains(&r.snapshot.mean));
+            }
+        }
+
+        /// The incremental global sum always equals the exact per-link sum,
+        /// whatever interleaving of observe / quarantine on whatever links.
+        #[test]
+        fn global_sum_invariant(ops in proptest::collection::vec((0usize..6, 0u8..3, 0.0f64..=1.0), 1..300)) {
+            let t = TwinStore::new();
+            let ids: Vec<LinkId> = (0..6).map(|i| l(&format!("n{i}"), &format!("n{}", i + 1))).collect();
+            for (i, kind, x) in ops {
+                match kind {
+                    0 | 1 => { t.observe(&ids[i], x, 0.05, 100).unwrap(); }
+                    _ => { t.set_quarantined(&ids[i], x > 0.5, "p").unwrap(); }
+                }
+                prop_assert!(t.std_sum_drift().unwrap() < 1e-9);
+                let g = t.global_avg_std().unwrap();
+                prop_assert!((0.0..=1.0).contains(&g));
+            }
+        }
+    }
+}
+EOF
+echo done
+
+Response:
+
+{"returncode":0,"stdout":"done\n","stderr":""}
