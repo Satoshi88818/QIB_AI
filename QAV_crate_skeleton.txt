@@ -1,0 +1,425 @@
+mkdir -p /home/squire/qib/src /home/squire/qib/tests /home/squire/qib/formal && cd /home/squire/qib
+cat > Cargo.toml <<'EOF'
+[package]
+name = "qib-verifier"
+version = "18.0.0"
+edition = "2021"
+rust-version = "1.75"
+description = "QIB AI Verifier core: safety gate between an AI routing controller and the network"
+
+[lib]
+name = "qib_verifier"
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "1"
+sha2 = "0.10"
+ed25519-dalek = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+EOF
+cat > src/errors.rs <<'EOF'
+//! Explicit error type. No silent `unwrap_or_default()` on safety paths.
+use std::sync::{Mutex, MutexGuard};
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq)]
+pub enum VerifierError {
+    #[error("no path from {0} to {1}")]
+    NoPath(String, String),
+    #[error("invalid observation {0}: fidelity must be finite and within [0,1]")]
+    InvalidObservation(f64),
+    #[error("unknown link {0}")]
+    UnknownLink(String),
+    #[error("probe rejected: {0}")]
+    ProbeRejected(String),
+    #[error("config error: {0}")]
+    Config(String),
+    #[error("graph error: {0}")]
+    Graph(String),
+    #[error("audit error: {0}")]
+    Audit(String),
+    #[error("valid operator identity required")]
+    OperatorRequired,
+    #[error("internal lock poisoned")]
+    LockPoisoned,
+}
+
+pub type Result<T> = std::result::Result<T, VerifierError>;
+
+/// Lock a mutex, mapping poisoning to an explicit error (never `unwrap`/`expect`).
+pub(crate) fn lock<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
+    m.lock().map_err(|_| VerifierError::LockPoisoned)
+}
+EOF
+cat > src/clock.rs <<'EOF'
+//! Injectable time source. Monotonic time drives windows; wall-clock drives
+//! probe freshness and audit timestamps.
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+pub trait Clock: Send + Sync {
+    /// Monotonic nanoseconds (never goes backwards).
+    fn now_ns(&self) -> u64;
+    /// Wall-clock milliseconds since the Unix epoch.
+    fn unix_ms(&self) -> u64;
+}
+
+pub struct SystemClock {
+    start: Instant,
+}
+
+impl SystemClock {
+    pub fn new() -> Self {
+        Self { start: Instant::now() }
+    }
+}
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for SystemClock {
+    fn now_ns(&self) -> u64 {
+        self.start.elapsed().as_nanos() as u64
+    }
+    fn unix_ms(&self) -> u64 {
+        // A pre-1970 system clock is a fault; report 0 so freshness checks fail closed.
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// Deterministic clock for tests and simulation.
+pub struct ManualClock {
+    ns: AtomicU64,
+    base_unix_ms: u64,
+}
+
+impl ManualClock {
+    /// `base_unix_ms` is the wall-clock reading at monotonic time zero.
+    pub fn new(base_unix_ms: u64) -> Self {
+        Self { ns: AtomicU64::new(0), base_unix_ms }
+    }
+    pub fn advance_ms(&self, ms: u64) {
+        self.ns.fetch_add(ms * 1_000_000, Ordering::SeqCst);
+    }
+    pub fn advance_secs(&self, s: u64) {
+        self.advance_ms(s * 1000);
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_ns(&self) -> u64 {
+        self.ns.load(Ordering::SeqCst)
+    }
+    fn unix_ms(&self) -> u64 {
+        self.base_unix_ms + self.ns.load(Ordering::SeqCst) / 1_000_000
+    }
+}
+EOF
+cat > src/config.rs <<'EOF'
+//! Configuration.
+//!
+//! * `[SC]` constants (below) are compile-time and are NOT reloadable.
+//! * `RuntimeConfig` fields are hot-reloadable, but every reload is validated
+//!   against the `[SC]` hard caps, so editing a file can never relax a safety
+//!   gate beyond what the compiled code allows (v17 allowed `reject = 1.0`).
+use crate::errors::{Result, VerifierError};
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+
+// ── [SC] safety-critical compile-time constants ─────────────────────────────
+/// Absolute ceiling for the path-reject std threshold, whatever config says.
+pub const HARD_PATH_REJECT_CAP: f64 = 0.20;
+pub const HARD_TAX_MULTIPLIER_CAP: f64 = 100.0;
+/// A physical probe passes at or above this fidelity.
+pub const PROBE_PASS_THRESHOLD: f64 = 0.90;
+/// A failed probe quarantines the link if the twin had predicted at least this
+/// (i.e. the AI believed the link would pass). v17 used 0.99, which let a link
+/// predicted at 0.95 fail a physical probe without quarantine.
+pub const QUARANTINE_PREDICTION_THRESHOLD: f64 = PROBE_PASS_THRESHOLD;
+pub const CRITICAL_CONSECUTIVE_WINDOWS: u64 = 3;
+pub const CRITICAL_WINDOW_NS: u64 = 3 * 60 * 1_000_000_000;
+/// Links with fewer samples report maximum uncertainty (std = 1.0).
+pub const MIN_SAMPLES_FOR_CONFIDENCE: u64 = 5;
+pub const LEARNING_RATE_NORMAL: f64 = 1.0;
+pub const LEARNING_RATE_THROTTLED: f64 = 0.001;
+/// Added to every AI hop cost so zero-cost hops cannot occur.
+pub const HOP_COST_FLOOR: f64 = 1e-6;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeConfig {
+    // twin / IMP-U
+    pub safety_tax_threshold: f64,
+    pub path_reject_threshold: f64,
+    pub safety_tax_multiplier: f64,
+    pub decay_alpha: f64,
+    pub brier_drift_threshold: f64,
+    pub brier_eval_window: u64,
+    // conservative AI mode
+    pub conservative_tax_multiplier: f64,
+    pub conservative_reject_threshold: f64,
+    // breaker / diversity
+    pub critical_delta_threshold: f64,
+    pub diversity_link_threshold: usize,
+    pub global_uncertainty_spike_threshold: f64,
+    // drift detector
+    pub drift_ewma_alpha: f64,
+    pub drift_escalation_threshold: f64,
+    pub drift_reset_ratio: f64,
+    pub drift_overconfidence_std: f64,
+    pub drift_min_samples: u64,
+    // zones
+    pub zone_quarantine_link_threshold: usize,
+    // cache
+    pub cache_capacity: usize,
+    pub cache_ttl_ms: u64,
+    // probes
+    pub probe_max_age_ms: u64,
+    pub probe_nonce_capacity: usize,
+    // health
+    pub health_top_n: usize,
+    pub health_trend_window_secs: u64,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            safety_tax_threshold: 0.05,
+            path_reject_threshold: 0.15,
+            safety_tax_multiplier: 2.5,
+            decay_alpha: 0.05,
+            brier_drift_threshold: 0.25,
+            brier_eval_window: 100,
+            conservative_tax_multiplier: 10.0,
+            conservative_reject_threshold: 0.08,
+            critical_delta_threshold: 0.20,
+            diversity_link_threshold: 5,
+            global_uncertainty_spike_threshold: 0.08,
+            drift_ewma_alpha: 0.10,
+            drift_escalation_threshold: 0.12,
+            drift_reset_ratio: 0.8,
+            drift_overconfidence_std: 0.02,
+            drift_min_samples: 20,
+            zone_quarantine_link_threshold: 3,
+            cache_capacity: 1024,
+            cache_ttl_ms: 5_000,
+            probe_max_age_ms: 30_000,
+            probe_nonce_capacity: 65_536,
+            health_top_n: 5,
+            health_trend_window_secs: 300,
+        }
+    }
+}
+
+fn in_range(name: &str, x: f64, lo: f64, hi: f64) -> Result<()> {
+    // `!(..)` form also rejects NaN.
+    if x.is_finite() && x > lo && x <= hi {
+        Ok(())
+    } else {
+        Err(VerifierError::Config(format!("{name}={x} must be in ({lo}, {hi}]")))
+    }
+}
+
+impl RuntimeConfig {
+    pub fn validate(&self) -> Result<()> {
+        in_range("safety_tax_threshold", self.safety_tax_threshold, 0.0, 1.0)?;
+        in_range("path_reject_threshold", self.path_reject_threshold, 0.0, HARD_PATH_REJECT_CAP)?;
+        if self.safety_tax_threshold >= self.path_reject_threshold {
+            return Err(VerifierError::Config(
+                "safety_tax_threshold must be below path_reject_threshold".into(),
+            ));
+        }
+        in_range("safety_tax_multiplier", self.safety_tax_multiplier, 0.999_999, HARD_TAX_MULTIPLIER_CAP)?;
+        in_range("conservative_tax_multiplier", self.conservative_tax_multiplier, 0.999_999, HARD_TAX_MULTIPLIER_CAP)?;
+        if self.conservative_tax_multiplier < self.safety_tax_multiplier {
+            return Err(VerifierError::Config(
+                "conservative_tax_multiplier must be >= safety_tax_multiplier".into(),
+            ));
+        }
+        in_range("conservative_reject_threshold", self.conservative_reject_threshold, 0.0, self.path_reject_threshold)?;
+        if self.conservative_reject_threshold <= self.safety_tax_threshold {
+            return Err(VerifierError::Config(
+                "conservative_reject_threshold must exceed safety_tax_threshold".into(),
+            ));
+        }
+        if !(self.decay_alpha.is_finite() && (0.0..=0.5).contains(&self.decay_alpha)) {
+            return Err(VerifierError::Config("decay_alpha must be in [0, 0.5]".into()));
+        }
+        in_range("brier_drift_threshold", self.brier_drift_threshold, 0.0, 1.0)?;
+        in_range("critical_delta_threshold", self.critical_delta_threshold, 0.0, 1.0)?;
+        in_range("global_uncertainty_spike_threshold", self.global_uncertainty_spike_threshold, 0.0, 1.0)?;
+        in_range("drift_ewma_alpha", self.drift_ewma_alpha, 0.0, 1.0)?;
+        in_range("drift_escalation_threshold", self.drift_escalation_threshold, 0.0, 1.0)?;
+        if !(self.drift_reset_ratio.is_finite() && self.drift_reset_ratio > 0.0 && self.drift_reset_ratio < 1.0) {
+            return Err(VerifierError::Config("drift_reset_ratio must be in (0, 1)".into()));
+        }
+        in_range("drift_overconfidence_std", self.drift_overconfidence_std, 0.0, 1.0)?;
+        for (n, v) in [
+            ("brier_eval_window", self.brier_eval_window),
+            ("drift_min_samples", self.drift_min_samples),
+            ("cache_ttl_ms", self.cache_ttl_ms),
+            ("probe_max_age_ms", self.probe_max_age_ms),
+            ("health_trend_window_secs", self.health_trend_window_secs),
+        ] {
+            if v == 0 {
+                return Err(VerifierError::Config(format!("{n} must be > 0")));
+            }
+        }
+        for (n, v) in [
+            ("diversity_link_threshold", self.diversity_link_threshold),
+            ("zone_quarantine_link_threshold", self.zone_quarantine_link_threshold),
+            ("cache_capacity", self.cache_capacity),
+            ("probe_nonce_capacity", self.probe_nonce_capacity),
+            ("health_top_n", self.health_top_n),
+        ] {
+            if v == 0 {
+                return Err(VerifierError::Config(format!("{n} must be > 0")));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Atomically swappable, validated configuration snapshot.
+pub struct ConfigStore {
+    current: RwLock<Arc<RuntimeConfig>>,
+    version: AtomicU64,
+}
+
+impl ConfigStore {
+    pub fn new(cfg: RuntimeConfig) -> Result<Self> {
+        cfg.validate()?;
+        Ok(Self { current: RwLock::new(Arc::new(cfg)), version: AtomicU64::new(1) })
+    }
+
+    /// The guarded value is an `Arc` swapped whole, so it is always consistent
+    /// even if a writer panicked; recover from poisoning rather than panic.
+    pub fn get(&self) -> Arc<RuntimeConfig> {
+        match self.current.read() {
+            Ok(g) => Arc::clone(&g),
+            Err(p) => Arc::clone(&p.into_inner()),
+        }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
+    }
+
+    /// Parse + validate + swap. On any failure the old config stays in force.
+    /// Returns the names of the fields that changed.
+    pub fn reload_from_str(&self, toml_text: &str) -> Result<Vec<String>> {
+        let new: RuntimeConfig =
+            toml::from_str(toml_text).map_err(|e| VerifierError::Config(e.to_string()))?;
+        new.validate()?;
+        let old = self.get();
+        let changed = changed_fields(&old, &new)?;
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        let mut w = self.current.write().map_err(|_| VerifierError::LockPoisoned)?;
+        *w = Arc::new(new);
+        self.version.fetch_add(1, Ordering::SeqCst);
+        Ok(changed)
+    }
+
+    pub fn reload_from_path(&self, path: &std::path::Path) -> Result<Vec<String>> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| VerifierError::Config(format!("{}: {e}", path.display())))?;
+        self.reload_from_str(&text)
+    }
+}
+
+fn changed_fields(a: &RuntimeConfig, b: &RuntimeConfig) -> Result<Vec<String>> {
+    let to_map = |c: &RuntimeConfig| -> Result<serde_json::Map<String, serde_json::Value>> {
+        match serde_json::to_value(c).map_err(|e| VerifierError::Config(e.to_string()))? {
+            serde_json::Value::Object(m) => Ok(m),
+            _ => Err(VerifierError::Config("config did not serialise to an object".into())),
+        }
+    };
+    let (ma, mb) = (to_map(a)?, to_map(b)?);
+    let mut out: Vec<String> = mb.iter().filter(|(k, v)| ma.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect();
+    out.sort();
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_valid() {
+        RuntimeConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn reject_threshold_above_hard_cap_is_refused() {
+        // Regression: v17 let a config edit set reject = 1.0, disabling IMP-U.
+        let c = RuntimeConfig { path_reject_threshold: 1.0, ..Default::default() };
+        assert!(c.validate().is_err());
+        let c = RuntimeConfig { path_reject_threshold: HARD_PATH_REJECT_CAP + 1e-9, ..Default::default() };
+        assert!(c.validate().is_err());
+        let c = RuntimeConfig { path_reject_threshold: HARD_PATH_REJECT_CAP, ..Default::default() };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn nan_and_inf_are_refused() {
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            assert!(RuntimeConfig { safety_tax_threshold: bad, ..Default::default() }.validate().is_err());
+            assert!(RuntimeConfig { drift_ewma_alpha: bad, ..Default::default() }.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn conservative_must_be_stricter() {
+        assert!(RuntimeConfig { conservative_tax_multiplier: 1.0, ..Default::default() }.validate().is_err());
+        assert!(RuntimeConfig { conservative_reject_threshold: 0.14, path_reject_threshold: 0.10, ..Default::default() }
+            .validate()
+            .is_err());
+        assert!(RuntimeConfig { conservative_reject_threshold: 0.04, ..Default::default() }.validate().is_err());
+    }
+
+    #[test]
+    fn reload_valid_partial_toml_and_bump_version() {
+        let s = ConfigStore::new(RuntimeConfig::default()).unwrap();
+        let ch = s.reload_from_str("safety_tax_multiplier = 3.0\n").unwrap();
+        assert_eq!(ch, vec!["safety_tax_multiplier".to_string()]);
+        assert_eq!(s.get().safety_tax_multiplier, 3.0);
+        assert_eq!(s.version(), 2);
+        // identical reload: no change, no version bump
+        assert!(s.reload_from_str("safety_tax_multiplier = 3.0\n").unwrap().is_empty());
+        assert_eq!(s.version(), 2);
+    }
+
+    #[test]
+    fn reload_invalid_keeps_old_config() {
+        let s = ConfigStore::new(RuntimeConfig::default()).unwrap();
+        assert!(s.reload_from_str("path_reject_threshold = 0.9\n").is_err());
+        assert!(s.reload_from_str("not toml at all ===").is_err());
+        assert!(s.reload_from_str("typo_field = 1\n").is_err()); // deny_unknown_fields
+        assert_eq!(*s.get(), RuntimeConfig::default());
+        assert_eq!(s.version(), 1);
+    }
+}
+EOF
+echo ok
+
+Response:
+
+{"returncode":0,"stdout":"ok\n","stderr":""}
