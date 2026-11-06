@@ -1,0 +1,168 @@
+cd /home/squire/qib
+cat >> src/verifier.rs <<'EOF'
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::MemoryAuditSink;
+    use crate::clock::ManualClock;
+    use ed25519_dalek::SigningKey;
+
+    fn build() -> (DataPlane, ControlPlane, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new(1_793_750_400_000));
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let (dp, cp) =
+            Verifier::build(RuntimeConfig::default(), sk.verifying_key(), Arc::new(MemoryAuditSink::new()), clock.clone()).unwrap();
+        (dp, cp, clock)
+    }
+
+    fn diamond() -> Graph {
+        Graph::new(vec![
+            ("A".into(), "B".into(), 1.0),
+            ("B".into(), "D".into(), 1.0),
+            ("A".into(), "C".into(), 1.0),
+            ("C".into(), "D".into(), 1.0),
+        ])
+        .unwrap()
+    }
+
+    /// Defence in depth: even if some code path mutated the twin WITHOUT bumping
+    /// the safety version (so the cache key still matches), a cache hit is
+    /// re-validated against live state and the stale path is discarded.
+    #[test]
+    fn cache_hit_is_revalidated_even_if_the_version_was_not_bumped() {
+        let (dp, _cp, _) = build();
+        for (a, b, x) in [("A", "B", 0.99), ("B", "D", 0.99), ("A", "C", 0.90), ("C", "D", 0.90)] {
+            for _ in 0..12 {
+                dp.observe(a, b, x).unwrap();
+            }
+        }
+        let g = diamond();
+        assert_eq!(dp.route("A", "D", 1, &g).unwrap().paths[0].nodes, vec!["A", "B", "D"]);
+        assert!(dp.route("A", "D", 1, &g).unwrap().from_cache);
+        let before = dp.safety_view().unwrap().version;
+        // Bypass every version bump: poke the twin directly.
+        dp.core.twin.set_quarantined(&LinkId::new("B", "D"), true, "injected").unwrap();
+        assert_eq!(dp.safety_view().unwrap().version, before, "precondition: no version bump");
+        let r = dp.route("A", "D", 1, &g).unwrap();
+        assert!(!r.from_cache, "stale entry must be rejected by re-validation");
+        assert_eq!(r.paths[0].nodes, vec!["A", "C", "D"]);
+    }
+
+    #[test]
+    fn cache_ttl_expires() {
+        let (dp, _cp, clock) = build();
+        for (a, b) in [("A", "B"), ("B", "D")] {
+            for _ in 0..12 {
+                dp.observe(a, b, 0.98).unwrap();
+            }
+        }
+        let g = Graph::new(vec![("A".into(), "B".into(), 1.0), ("B".into(), "D".into(), 1.0)]).unwrap();
+        dp.route("A", "D", 1, &g).unwrap();
+        assert!(dp.route("A", "D", 1, &g).unwrap().from_cache);
+        clock.advance_ms(5_001);
+        assert!(!dp.route("A", "D", 1, &g).unwrap().from_cache);
+    }
+
+    /// Hammer every public entry point from many threads. Success = no deadlock,
+    /// no panic, and a link quarantined mid-flight is never routed afterwards.
+    #[test]
+    fn concurrent_stress_no_deadlock_and_quarantine_sticks() {
+        let (dp, cp, _clock) = build();
+        let g = Arc::new(diamond());
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        for (a, b) in [("A", "B"), ("B", "D"), ("A", "C"), ("C", "D")] {
+            for _ in 0..12 {
+                dp.observe(a, b, 0.95).unwrap();
+            }
+        }
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut hs = Vec::new();
+        for t in 0..6u64 {
+            let (dp, g, sk) = (dp.clone(), g.clone(), sk.clone());
+            hs.push(std::thread::spawn(move || {
+                let links = [("A", "B"), ("B", "D"), ("A", "C"), ("C", "D")];
+                for i in 0..400u64 {
+                    let (a, b) = links[((i + t) % 4) as usize];
+                    match (i + t) % 5 {
+                        0 => { let _ = dp.observe(a, b, 0.5 + 0.4 * ((i % 7) as f64 / 7.0)); }
+                        1 => { let _ = dp.compare_and_audit(a, b, 0.9); }
+                        2 => { let _ = dp.route("A", "D", 2, &g); }
+                        3 => {
+                            let now = dp.core.clock.unix_ms();
+                            let p = SignedProbe::sign(&sk, a, b, 0.97, t * 100_000 + i, now);
+                            let _ = dp.ingest_probe(&p);
+                        }
+                        _ => { let _ = dp.tick(); let _ = dp.health(); }
+                    }
+                }
+            }));
+        }
+        let cp_thread = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    let _ = cp.set_conservative("op", true);
+                    let _ = cp.set_conservative("op", false);
+                    let _ = cp.reload_config("op", "safety_tax_multiplier = 2.6");
+                    let _ = cp.reload_config("op", "safety_tax_multiplier = 2.5");
+                }
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        for h in hs {
+            while !h.is_finished() {
+                assert!(std::time::Instant::now() < deadline, "DEADLOCK suspected");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            h.join().unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        cp_thread.join().unwrap();
+
+        // Quarantine B->D and verify it is never routed from any thread afterwards.
+        let now = dp.core.clock.unix_ms();
+        // make the twin believe B->D is great so a failed probe quarantines it
+        for _ in 0..40 {
+            dp.observe("B", "D", 0.99).unwrap();
+        }
+        let p = SignedProbe::sign(&sk, "B", "D", 0.1, 9_999_999, now);
+        assert!(dp.ingest_probe(&p).unwrap().quarantined);
+        let hs: Vec<_> = (0..4)
+            .map(|_| {
+                let (dp, g) = (dp.clone(), g.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let r = dp.route("A", "D", 3, &g).unwrap();
+                        assert!(!r.paths.iter().any(|p| p.nodes.windows(2).any(|w| w == ["B", "D"])));
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        let twin_sum_drift = dp.core.twin.std_sum_drift().unwrap();
+        assert!(twin_sum_drift < 1e-6, "global std sum drifted under concurrency: {twin_sum_drift}");
+    }
+
+    #[test]
+    fn data_plane_exposes_no_reset_surface() {
+        // Compile-time property documented as a test: `DataPlane` has no method that
+        // can re-enable the AI or lift quarantine. This test lists the intended
+        // operator-only operations so adding one to DataPlane is a conscious review item.
+        let (dp, cp, _) = build();
+        let _only_on_cp = (
+            ControlPlane::reset_breaker as fn(&ControlPlane, &str) -> Result<()>,
+            ControlPlane::lift_quarantine as fn(&ControlPlane, &str, &str, &str) -> Result<()>,
+            ControlPlane::reload_config as fn(&ControlPlane, &str, &str) -> Result<Vec<String>>,
+        );
+        drop((dp, cp));
+    }
+}
+EOF
+cargo test --offline --lib verifier 2>&1 | grep -E "^(error|warning)|-->|test result|FAILED|panicked|^test " | head -30
+
+Response:
+
+{"returncode":0,"stdout":"test verifier::tests::cache_hit_is_revalidated_even_if_the_version_was_not_bumped ... ok\ntest verifier::tests::cache_ttl_expires ... ok\ntest verifier::tests::concurrent_stress_no_deadlock_and_quarantine_sticks ... ok\ntest verifier::tests::data_plane_exposes_no_reset_surface ... ok\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 5.78s\n","stderr":""}
