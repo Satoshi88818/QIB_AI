@@ -1,0 +1,50 @@
+cd /home/squire/qib/formal
+cat > run_tlc.sh <<'EOF'
+#!/usr/bin/env bash
+# Runs the TLC model checker on formal/QibSafety.tla.
+#  1. REAL config: every invariant and temporal property must pass.
+#  2. MUTATIONS: each broken variant must produce a violation (proves the
+#     properties are not vacuous).
+#  3. REACHABILITY: "bad-looking" states must be reachable (proves the model is
+#     not trivially stuck in the initial state).
+# Requires Java 11+ and tla2tools.jar next to this script.
+set -u
+cd "$(dirname "$0")"
+JAR=${TLA2TOOLS:-tla2tools.jar}
+[ -f "$JAR" ] || { echo "missing $JAR (download tla2tools.jar from github.com/tlaplus/tlaplus/releases)"; exit 2; }
+tlc() { java -XX:+UseParallelGC -jar "$JAR" -workers auto -config "$1" QibSafety.tla 2>&1; }
+mkcfg() { # name invalidate autorecover tripcons invariants... -- properties...
+  local name=$1 inv=$2 rec=$3 tc=$4 invs=$5 props=$6
+  { echo "SPECIFICATION Spec"; echo "CONSTANTS"; echo "  Links = {l1, l2, l3}"; echo "  MaxWindows = 2"; echo "  MaxDiv = 2";
+    echo "  InvalidateOnChange = $inv"; echo "  AutoRecover = $rec"; echo "  TripSetsConservative = $tc";
+    [ -n "$invs" ] && { echo "INVARIANTS"; for i in $invs; do echo "  $i"; done; }
+    [ -n "$props" ] && { echo "PROPERTIES"; for p in $props; do echo "  $p"; done; }
+  } > "$name"
+}
+ALLINV="TypeOK RouteNeverQuarantined RouteGateRespected StageIffTripped StageImpliesConservative BreakerThresholds MeshImpliesStage"
+ALLPROP="LatchProp StageMonotone MeshProbeRuns"
+fail=0
+echo "== 1. real configuration =="
+out=$(tlc QibSafety.cfg); echo "$out" | grep -E "distinct states found|No error|Error:|violated" | tail -3
+echo "$out" | grep -q "No error has been found" || { echo "FAIL: real config has a violation"; fail=1; }
+
+expect_violation() { # label cfg
+  out=$(tlc "$2"); v=$(echo "$out" | grep -E "Invariant .* is violated|Temporal properties were violated|Action property .* is violated" | head -1)
+  if [ -n "$v" ]; then echo "  OK  (killed)  $1  -> $v"; else echo "  FAIL (survived) $1"; fail=1; fi
+}
+echo "== 2. mutations (each MUST be caught) =="
+mkcfg /tmp/m1.cfg FALSE FALSE TRUE "$ALLINV" "$ALLPROP"; expect_violation "stale route not revalidated (v17 cache bug)" /tmp/m1.cfg
+mkcfg /tmp/m2.cfg TRUE  TRUE  TRUE "$ALLINV" "$ALLPROP"; expect_violation "breaker re-enables itself (latch broken)" /tmp/m2.cfg
+mkcfg /tmp/m3.cfg TRUE  FALSE FALSE "$ALLINV" "$ALLPROP"; expect_violation "trip does not set conservative" /tmp/m3.cfg
+echo "== 3. reachability sanity (each MUST be violated = state reachable) =="
+for inv in NeverTripped NeverRouteServed NeverConservative NeverQuarantinedAny; do
+  mkcfg /tmp/r_$inv.cfg TRUE FALSE TRUE "$inv" ""; expect_violation "reachable: not $inv" /tmp/r_$inv.cfg
+done
+[ $fail = 0 ] && echo "ALL TLC CHECKS AS EXPECTED" || echo "SOME TLC CHECKS FAILED"
+exit $fail
+EOF
+chmod +x run_tlc.sh; ./run_tlc.sh 2>&1 | tail -25
+
+Response:
+
+{"returncode":0,"stdout":"== 1. real configuration ==\nProgress(14) at 2026-11-05 01:05:05: 4,122,873 states generated, 142,432 distinct states found, 0 states left on queue.\nModel checking completed. No error has been found.\n4122873 states generated, 142432 distinct states found, 0 states left on queue.\n== 2. mutations (each MUST be caught) ==\n  OK  (killed)  stale route not revalidated (v17 cache bug)  -> Error: Invariant RouteGateRespected is violated.\n  OK  (killed)  breaker re-enables itself (latch broken)  -> Error: Invariant BreakerThresholds is violated.\n  OK  (killed)  trip does not set conservative  -> Error: Invariant StageImpliesConservative is violated.\n== 3. reachability sanity (each MUST be violated = state reachable) ==\n  OK  (killed)  reachable: not NeverTripped  -> Error: Invariant NeverTripped is violated.\n  OK  (killed)  reachable: not NeverRouteServed  -> Error: Invariant NeverRouteServed is violated.\n  OK  (killed)  reachable: not NeverConservative  -> Error: Invariant NeverConservative is violated.\n  OK  (killed)  reachable: not NeverQuarantinedAny  -> Error: Invariant NeverQuarantinedAny is violated.\nALL TLC CHECKS AS EXPECTED\n","stderr":""}
