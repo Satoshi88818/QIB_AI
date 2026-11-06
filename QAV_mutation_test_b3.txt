@@ -1,0 +1,5 @@
+cd /home/squire/qib && python3 /tmp/mutate.py M11 M12 M13 M14 M15 2>&1 | tail -12
+
+Response:
+
+{"returncode":0,"stdout":"M11 NaN observation accepted (clamp instead of reject): KILLED (2 failing: invalid_inputs_are_rejected_not_absorbed, rejects_non_finite_and_out_of_range)\nM12 zone threshold capped by unrelated setting (v17 bug): KILLED (1 failing: zone_quarantine_via_probes_and_operator_lift)\nM13 safe mode ignores quarantine: KILLED (4 failing: safe_mode_honours_quarantine, no_route_ever_uses_a_forbidden_link, quarantine_is_honoured_even_by_the_static_fallback…)\nM14 drift hysteresis removed (re-fires every flap): KILLED (2 failing: early_escalation_fires_once_per_excursion_with_hysteresis, drift_escalation_ladder_reaches_diverse_conservative_routing_and_chaos_clears)\nM15 audit failure no longer blocks operator reset: KILLED (1 failing: reset_fails_closed_when_audit_is_down)\n","stderr":""}
