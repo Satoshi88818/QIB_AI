@@ -1,0 +1,594 @@
+cd /home/squire/qib
+cat > src/lib.rs <<'EOF'
+//! QIB AI Verifier core (v18).
+//!
+//! A safety gate between an untrusted AI routing controller and the network.
+//! The crate exposes two handles from [`Verifier::build`]:
+//!  * [`DataPlane`]    – what the AI controller process may call (observe, probe
+//!                       ingest, compare, route, health). It cannot reset the
+//!                       breaker, lift quarantines, change config, or toggle modes.
+//!  * [`ControlPlane`] – operator-only actions, every one audited first (fail closed).
+pub mod audit;
+pub mod breaker;
+pub mod cache;
+pub mod clock;
+pub mod config;
+pub mod drift;
+pub mod errors;
+pub mod graph;
+pub mod hop_cost;
+pub mod sentinel;
+pub mod twin;
+pub mod verifier;
+pub mod zone;
+
+pub use errors::{Result, VerifierError};
+pub use verifier::{ControlPlane, DataPlane, HealthReport, LinkView, MetricsSnapshot, ProbeOutcome, RouteResult, RoutedPath, Verifier};
+EOF
+cat > src/verifier.rs <<'EOF'
+//! Orchestration: wires the modules together and enforces the lock discipline
+//! (no module calls out while holding its own lock; audit appends happen after
+//! state locks are released, except operator actions which audit first).
+use crate::audit::{AuditEvent, AuditSink};
+use crate::breaker::{ChaosSource, SafetyState, SafetyView};
+use crate::cache::{CacheKey, RouteCache, RouteMode};
+use crate::clock::Clock;
+use crate::config::*;
+use crate::drift::{DriftDetector, DriftReport};
+use crate::errors::{lock, Result, VerifierError};
+use crate::graph::{edge_disjoint_paths, yen_k_shortest, Graph, Path};
+use crate::hop_cost::{gate_class, hop_cost, safe_hop_cost, CostParams, GateClass, HopInputs};
+use crate::sentinel::{ProbeVerifier, SignedProbe};
+use crate::twin::{LinkId, TwinStore};
+use crate::zone::ZoneRegistry;
+use ed25519_dalek::VerifyingKey;
+use serde::Serialize;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+struct Counters {
+    edges_rejected_uncertainty: AtomicU64,
+    probes_rejected: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    routes: AtomicU64,
+    safe_fallbacks: AtomicU64,
+}
+
+struct Core {
+    cfg: ConfigStore,
+    twin: TwinStore,
+    safety: SafetyState,
+    drift: DriftDetector,
+    zones: ZoneRegistry,
+    probes: ProbeVerifier,
+    cache: Mutex<RouteCache>,
+    audit: Arc<dyn AuditSink>,
+    clock: Arc<dyn Clock>,
+    counters: Counters,
+    trend: Mutex<VecDeque<(u64, f64)>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkView {
+    pub mean: f64,
+    pub std: f64,
+    pub samples: u64,
+    pub quarantined: bool,
+    pub safety_tax: bool,
+    pub path_reject: bool,
+    pub brier: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeOutcome {
+    pub link: String,
+    pub predicted: Option<f64>,
+    pub actual: f64,
+    pub passed: bool,
+    pub quarantined: bool,
+    pub zone_quarantined: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutedPath {
+    pub nodes: Vec<String>,
+    pub cost: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteResult {
+    pub paths: Vec<RoutedPath>,
+    pub mode: RouteMode,
+    pub from_cache: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MetricsSnapshot {
+    pub edges_rejected_uncertainty_total: u64,
+    pub diversity_breaker_triggered_total: u64,
+    pub probes_rejected_total: u64,
+    pub route_cache_hits_total: u64,
+    pub route_cache_misses_total: u64,
+    pub routes_total: u64,
+    pub safe_fallbacks_total: u64,
+    pub audit_failures_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HealthReport {
+    pub ai_trust_score: f64,
+    pub ai_active: bool,
+    pub escalation_stage: u64,
+    pub mean_uncertainty: f64,
+    pub quarantine_fraction: f64,
+    pub calibration_drift_detected: bool,
+    pub conservative_mode_active: bool,
+    pub chaos_active: bool,
+    pub learning_rate: f64,
+    /// Change in mean uncertainty over the trend window (positive = worsening).
+    pub uncertainty_trend: f64,
+    pub top_n_worst_links: Vec<(String, f64)>,
+    pub drift: DriftReport,
+    pub audit_failures: u64,
+}
+
+fn valid_operator(op: &str) -> Result<&str> {
+    let t = op.trim();
+    if t.is_empty() || t.len() > 128 || t.chars().any(|c| c.is_control()) {
+        return Err(VerifierError::OperatorRequired);
+    }
+    Ok(t)
+}
+
+fn params_for(view: &SafetyView, cfg: &RuntimeConfig) -> CostParams {
+    if view.conservative {
+        CostParams::conservative(cfg)
+    } else {
+        CostParams::standard(cfg)
+    }
+}
+
+pub struct Verifier;
+
+impl Verifier {
+    pub fn build(
+        cfg: RuntimeConfig,
+        probe_key: VerifyingKey,
+        audit: Arc<dyn AuditSink>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<(DataPlane, ControlPlane)> {
+        let core = Arc::new(Core {
+            cfg: ConfigStore::new(cfg)?,
+            twin: TwinStore::new(),
+            safety: SafetyState::new(audit.clone()),
+            drift: DriftDetector::new(),
+            zones: ZoneRegistry::new(),
+            probes: ProbeVerifier::new(probe_key),
+            cache: Mutex::new(RouteCache::new()),
+            audit,
+            clock,
+            counters: Counters::default(),
+            trend: Mutex::new(VecDeque::new()),
+        });
+        Ok((DataPlane { core: core.clone() }, ControlPlane { core }))
+    }
+}
+
+// ═════════════════════════════════ DATA PLANE ═════════════════════════════════
+
+#[derive(Clone)]
+pub struct DataPlane {
+    core: Arc<Core>,
+}
+
+impl DataPlane {
+    /// IMP-P: feed a fidelity observation.
+    pub fn observe(&self, src: &str, dst: &str, fidelity: f64) -> Result<LinkView> {
+        let c = &self.core;
+        let cfg = c.cfg.get();
+        let link = LinkId::new(src, dst);
+        let r = c.twin.observe(&link, fidelity, cfg.decay_alpha, cfg.brier_eval_window)?;
+        // A std change that crosses a gate boundary alters routing legality: bump
+        // the version so cached routes are not served across the boundary.
+        let view = c.safety.view()?;
+        let p = params_for(&view, &cfg);
+        let mk = |std: f64| HopInputs { mean: r.snapshot.mean, std, quarantined: false };
+        if gate_class(&mk(r.std_before), &p) != gate_class(&mk(r.snapshot.std), &p) {
+            c.safety.bump_version()?;
+        }
+        Ok(link_view(&r.snapshot, &p))
+    }
+
+    pub fn link(&self, src: &str, dst: &str) -> Result<Option<LinkView>> {
+        let c = &self.core;
+        let cfg = c.cfg.get();
+        let p = params_for(&c.safety.view()?, &cfg);
+        Ok(c.twin.snapshot(&LinkId::new(src, dst), cfg.brier_eval_window)?.map(|s| link_view(&s, &p)))
+    }
+
+    /// IMP-T: compare the twin's prediction with ground truth and feed breaker + drift.
+    ///
+    /// NOTE: `actual_fidelity` must come from an independent measurement path, not
+    /// from the AI controller being audited (see threat model in the README).
+    pub fn compare_and_audit(&self, src: &str, dst: &str, actual_fidelity: f64) -> Result<f64> {
+        let c = &self.core;
+        let cfg = c.cfg.get();
+        let link = LinkId::new(src, dst);
+        let (delta, _pred) = c.twin.compare(&link, actual_fidelity, cfg.brier_eval_window)?; // twin lock released
+        c.safety.record_reality_delta(&link, delta, c.clock.now_ns(), &cfg)?;
+        let mean_std = c.twin.global_avg_std()?;
+        let act = c.drift.record(delta, mean_std, &cfg)?;
+        if act.early_escalate {
+            let rep = c.drift.report()?;
+            c.safety.emit_event(AuditEvent::DriftEarlyEscalation { ewma_delta: rep.ewma_delta, mean_std });
+            c.safety.advance_stage("drift early escalation")?;
+        }
+        c.safety.set_chaos_source(ChaosSource::Drift, act.overconfident)?;
+        Ok(delta)
+    }
+
+    /// IMP-Q: ingest a signed sentinel probe. The ONLY path by which a probe can
+    /// change quarantine state; unauthenticated probes return `Err` and do nothing.
+    pub fn ingest_probe(&self, p: &SignedProbe) -> Result<ProbeOutcome> {
+        let c = &self.core;
+        let cfg = c.cfg.get();
+        if let Err(e) = c.probes.verify(p, c.clock.unix_ms(), cfg.probe_max_age_ms, cfg.probe_nonce_capacity) {
+            c.counters.probes_rejected.fetch_add(1, Ordering::SeqCst);
+            c.safety.emit_event(AuditEvent::ProbeRejected { src: p.src.clone(), dst: p.dst.clone(), reason: e.to_string() });
+            return Err(e);
+        }
+        let link = LinkId::new(&p.src, &p.dst);
+        let predicted = c.twin.predicted_mean(&link)?;
+        let passed = p.actual_fidelity >= PROBE_PASS_THRESHOLD;
+        let should_quarantine = !passed && predicted.map_or(false, |x| x >= QUARANTINE_PREDICTION_THRESHOLD);
+
+        let mut quarantined = false;
+        let mut zone_q = None;
+        if should_quarantine {
+            let reason = format!("sentinel probe failed: predicted={:.3} actual={:.3}", predicted.unwrap_or(f64::NAN), p.actual_fidelity);
+            if c.twin.set_quarantined(&link, true, &reason)? {
+                c.safety.emit_event(AuditEvent::LinkQuarantined { src: p.src.clone(), dst: p.dst.clone(), reason });
+                if let Some(t) = c.zones.on_link_quarantined(&c.twin, &link, cfg.zone_quarantine_link_threshold)? {
+                    c.safety.emit_event(AuditEvent::ZoneQuarantined {
+                        zone: t.zone.clone(),
+                        links_affected: t.newly_quarantined.len() + 1,
+                    });
+                    zone_q = Some(t.zone);
+                }
+            }
+            quarantined = true;
+            c.safety.bump_version()?;
+        }
+        // The probe is ground truth: always teach the twin, pass or fail.
+        self.observe(&p.src, &p.dst, p.actual_fidelity)?;
+        Ok(ProbeOutcome {
+            link: link.to_string(),
+            predicted,
+            actual: p.actual_fidelity,
+            passed,
+            quarantined,
+            zone_quarantined: zone_q,
+        })
+    }
+
+    /// If escalation stage 2 requested a full-mesh probe, returns the links to probe
+    /// (consumes the request). The prober feeds results back via `ingest_probe`.
+    pub fn take_mesh_probe_request(&self) -> Result<Option<Vec<LinkId>>> {
+        if self.core.safety.take_mesh_probe_request()? {
+            Ok(Some(self.core.twin.all_links()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn route(&self, src: &str, dst: &str, k: usize, g: &Graph) -> Result<RouteResult> {
+        let c = &self.core;
+        let no_path = || VerifierError::NoPath(src.to_owned(), dst.to_owned());
+        let (s, d) = (g.node(src).ok_or_else(no_path)?, g.node(dst).ok_or_else(no_path)?);
+        if s == d {
+            return Err(no_path());
+        }
+        let k = k.clamp(1, 64);
+        let cfg = c.cfg.get();
+        let view = c.safety.view()?;
+        let now = c.clock.now_ns();
+        c.counters.routes.fetch_add(1, Ordering::SeqCst);
+        let key = CacheKey {
+            src: s,
+            dst: d,
+            k,
+            graph_id: g.id(),
+            ai_enabled: view.ai_enabled,
+            conservative: view.conservative,
+            diverse: view.stage >= 3,
+            safety_version: view.version,
+            cfg_version: c.cfg.version(),
+        };
+
+        let cached = lock(&c.cache)?.get(&key, now, cfg.cache_ttl_ms);
+        if let Some(entry) = cached {
+            if let Some(costs) = self.revalidate(&entry.paths, entry.mode, g, &cfg)? {
+                c.counters.cache_hits.fetch_add(1, Ordering::SeqCst);
+                let paths = entry.paths.iter().zip(costs).map(|(e, cost)| routed(g, e, cost)).collect();
+                return Ok(RouteResult { paths, mode: entry.mode, from_cache: true });
+            }
+            lock(&c.cache)?.remove(&key); // stale beyond its version: drop it
+        }
+        c.counters.cache_misses.fetch_add(1, Ordering::SeqCst);
+
+        // One consistent twin snapshot for the whole computation.
+        let inputs = c.twin.hop_inputs_bulk(g.edge_links().iter())?;
+        let weights = g.edge_weights();
+        let diverse = view.stage >= 3;
+        let (mut mode, mut paths) = if view.ai_enabled {
+            let p = params_for(&view, &cfg);
+            let mut rejected = 0u64;
+            let costs: Vec<f64> = inputs
+                .iter()
+                .map(|i| {
+                    if !i.quarantined && gate_class(i, &p) == GateClass::Rejected {
+                        rejected += 1;
+                    }
+                    hop_cost(i, &p)
+                })
+                .collect();
+            c.counters.edges_rejected_uncertainty.fetch_add(rejected, Ordering::SeqCst);
+            (if view.conservative { RouteMode::AiConservative } else { RouteMode::Ai }, select(g, &costs, s, d, k, diverse))
+        } else {
+            (RouteMode::Safe, select(g, &safe_costs(&inputs, &weights), s, d, k, diverse))
+        };
+        if paths.is_empty() && view.ai_enabled {
+            // No AI-admissible path: fall back to the static topology (still honouring quarantine).
+            paths = select(g, &safe_costs(&inputs, &weights), s, d, k, diverse);
+            mode = RouteMode::SafeFallback;
+            c.counters.safe_fallbacks.fetch_add(1, Ordering::SeqCst);
+        }
+        if paths.is_empty() {
+            return Err(no_path());
+        }
+        let edge_lists: Vec<Vec<usize>> = paths.iter().map(|p| p.edges.clone()).collect();
+        lock(&c.cache)?.put(key, edge_lists, mode, now, cfg.cache_capacity);
+        Ok(RouteResult { paths: paths.iter().map(|p| routed(g, &p.edges, p.cost)).collect(), mode, from_cache: false })
+    }
+
+    /// Re-check every hop of a cached path against *current* twin state.
+    /// Returns fresh path costs if all hops are still admissible.
+    fn revalidate(&self, paths: &[Vec<usize>], mode: RouteMode, g: &Graph, cfg: &RuntimeConfig) -> Result<Option<Vec<f64>>> {
+        let links = g.edge_links();
+        let flat: Vec<usize> = paths.iter().flatten().copied().collect();
+        let inputs = self.core.twin.hop_inputs_bulk(flat.iter().map(|&e| &links[e]))?;
+        let weights = g.edge_weights();
+        let mut idx = 0;
+        let mut out = Vec::with_capacity(paths.len());
+        for p in paths {
+            let mut total = 0.0;
+            for &e in p {
+                let i = &inputs[idx];
+                idx += 1;
+                let c = match mode {
+                    RouteMode::Ai => hop_cost(i, &CostParams::standard(cfg)),
+                    RouteMode::AiConservative => hop_cost(i, &CostParams::conservative(cfg)),
+                    RouteMode::Safe | RouteMode::SafeFallback => safe_hop_cost(weights[e], i.quarantined),
+                };
+                if !(c.is_finite() && c >= 0.0) {
+                    return Ok(None);
+                }
+                total += c;
+            }
+            out.push(total);
+        }
+        Ok(Some(out))
+    }
+
+    /// Periodic housekeeping (call every few seconds): rolls breaker windows,
+    /// feeds the uncertainty-spike detector and the trend buffer.
+    pub fn tick(&self) -> Result<()> {
+        let c = &self.core;
+        let cfg = c.cfg.get();
+        let now = c.clock.now_ns();
+        c.safety.tick(now)?;
+        let avg = c.twin.global_avg_std()?;
+        c.safety.observe_global_uncertainty(avg, cfg.global_uncertainty_spike_threshold)?;
+        let mut t = lock(&c.trend)?;
+        t.push_back((now, avg));
+        let horizon = cfg.health_trend_window_secs.saturating_mul(1_000_000_000);
+        while t.front().map_or(false, |(ts, _)| now.saturating_sub(*ts) > horizon) {
+            t.pop_front();
+        }
+        Ok(())
+    }
+
+    /// Fraction (0–100) of topology-reachable ordered node pairs that still have an
+    /// admissible path under the current mode.
+    pub fn safe_routing_coverage_pct(&self, g: &Graph) -> Result<f64> {
+        let c = &self.core;
+        let cfg = c.cfg.get();
+        let view = c.safety.view()?;
+        let inputs = c.twin.hop_inputs_bulk(g.edge_links().iter())?;
+        let costs: Vec<f64> = if view.ai_enabled {
+            let p = params_for(&view, &cfg);
+            inputs.iter().map(|i| hop_cost(i, &p)).collect()
+        } else {
+            safe_costs(&inputs, &g.edge_weights())
+        };
+        let total = g.reachable_pairs(|_| true);
+        if total == 0 {
+            return Ok(100.0);
+        }
+        let ok = g.reachable_pairs(|e| costs[e].is_finite());
+        Ok(100.0 * ok as f64 / total as f64)
+    }
+
+    /// Read-only (does not mutate any tracking state, unlike v17's `health()`).
+    pub fn health(&self) -> Result<HealthReport> {
+        let c = &self.core;
+        let cfg = c.cfg.get();
+        let v = c.safety.view()?;
+        let avg = c.twin.global_avg_std()?;
+        let qf = c.twin.quarantine_fraction()?;
+        let calib = c.twin.any_calibration_drift(cfg.brier_drift_threshold, cfg.brier_eval_window)?;
+        let drift = c.drift.report()?;
+        let trend = {
+            let t = lock(&c.trend)?;
+            match (t.front(), t.back()) {
+                (Some((t0, a0)), Some((t1, a1))) if t1 > t0 => {
+                    let span = (*t1 - *t0) as f64 / 1e9;
+                    (a1 - a0) / span * cfg.health_trend_window_secs as f64
+                }
+                _ => 0.0,
+            }
+        };
+        let drift_pen = if calib || drift.overconfidence_detected { 1.0 } else { 0.0 };
+        let trust = 1.0
+            - (0.28 * avg.clamp(0.0, 1.0)
+                + 0.18 * qf
+                + 0.24 * (v.stage as f64 / 4.0)
+                + 0.14 * drift_pen
+                + 0.09 * if v.ai_enabled { 0.0 } else { 1.0 }
+                + 0.07 * if v.conservative { 1.0 } else { 0.0 });
+        Ok(HealthReport {
+            ai_trust_score: trust.clamp(0.0, 1.0),
+            ai_active: v.ai_enabled,
+            escalation_stage: v.stage,
+            mean_uncertainty: avg,
+            quarantine_fraction: qf,
+            calibration_drift_detected: calib,
+            conservative_mode_active: v.conservative,
+            chaos_active: v.chaos,
+            learning_rate: v.learning_rate,
+            uncertainty_trend: trend,
+            top_n_worst_links: c.twin.top_n_worst(cfg.health_top_n)?.into_iter().map(|(l, s)| (l.to_string(), s)).collect(),
+            drift: drift,
+            audit_failures: c.safety.audit_failures(),
+        })
+    }
+
+    pub fn drift_report(&self) -> Result<DriftReport> {
+        self.core.drift.report()
+    }
+    pub fn safety_view(&self) -> Result<SafetyView> {
+        self.core.safety.view()
+    }
+    pub fn learning_rate(&self) -> Result<f64> {
+        Ok(self.core.safety.view()?.learning_rate)
+    }
+    pub fn is_quarantined(&self, src: &str, dst: &str) -> Result<bool> {
+        self.core.twin.is_quarantined(&LinkId::new(src, dst))
+    }
+    pub fn metrics(&self) -> MetricsSnapshot {
+        let k = &self.core.counters;
+        MetricsSnapshot {
+            edges_rejected_uncertainty_total: k.edges_rejected_uncertainty.load(Ordering::SeqCst),
+            diversity_breaker_triggered_total: self.core.safety.diversity_trips(),
+            probes_rejected_total: k.probes_rejected.load(Ordering::SeqCst),
+            route_cache_hits_total: k.cache_hits.load(Ordering::SeqCst),
+            route_cache_misses_total: k.cache_misses.load(Ordering::SeqCst),
+            routes_total: k.routes.load(Ordering::SeqCst),
+            safe_fallbacks_total: k.safe_fallbacks.load(Ordering::SeqCst),
+            audit_failures_total: self.core.safety.audit_failures(),
+        }
+    }
+}
+
+fn link_view(s: &crate::twin::LinkSnapshot, p: &CostParams) -> LinkView {
+    let i = HopInputs { mean: s.mean, std: s.std, quarantined: s.quarantined };
+    let class = gate_class(&i, p);
+    LinkView {
+        mean: s.mean,
+        std: s.std,
+        samples: s.samples,
+        quarantined: s.quarantined,
+        safety_tax: class != GateClass::Clear,
+        path_reject: class == GateClass::Rejected || s.quarantined,
+        brier: s.brier,
+    }
+}
+
+fn safe_costs(inputs: &[HopInputs], weights: &[f64]) -> Vec<f64> {
+    inputs.iter().zip(weights).map(|(i, w)| safe_hop_cost(*w, i.quarantined)).collect()
+}
+
+fn select(g: &Graph, costs: &[f64], s: usize, d: usize, k: usize, diverse: bool) -> Vec<Path> {
+    if diverse {
+        let p = edge_disjoint_paths(g, costs, s, d, k);
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    yen_k_shortest(g, costs, s, d, k)
+}
+
+fn routed(g: &Graph, edges: &[usize], cost: f64) -> RoutedPath {
+    let mut nodes = Vec::with_capacity(edges.len() + 1);
+    if let Some(&e0) = edges.first() {
+        nodes.push(g.node_name(g.edge(e0).from).to_owned());
+    }
+    nodes.extend(edges.iter().map(|&e| g.node_name(g.edge(e).to).to_owned()));
+    RoutedPath { nodes, cost }
+}
+
+// ═══════════════════════════════ CONTROL PLANE ═══════════════════════════════
+
+/// Operator-only handle. Deliberately not `Clone`; keep it out of the AI process.
+pub struct ControlPlane {
+    core: Arc<Core>,
+}
+
+impl ControlPlane {
+    pub fn reset_breaker(&self, operator: &str) -> Result<()> {
+        let op = valid_operator(operator)?;
+        self.core.safety.operator_reset(op)?; // audits first, fails closed
+        self.core.drift.reset()?;
+        Ok(())
+    }
+
+    pub fn lift_quarantine(&self, operator: &str, src: &str, dst: &str) -> Result<()> {
+        let op = valid_operator(operator)?;
+        self.core.audit.append(&AuditEvent::QuarantineLifted { src: src.into(), dst: dst.into(), operator: op.into() })?;
+        self.core.twin.set_quarantined(&LinkId::new(src, dst), false, "")?;
+        self.core.safety.bump_version()
+    }
+
+    pub fn lift_zone(&self, operator: &str, zone: &str) -> Result<usize> {
+        let op = valid_operator(operator)?;
+        self.core.audit.append(&AuditEvent::ZoneLifted { zone: zone.into(), operator: op.into() })?;
+        let n = self.core.zones.lift_zone(&self.core.twin, zone)?.len();
+        self.core.safety.bump_version()?;
+        Ok(n)
+    }
+
+    pub fn set_conservative(&self, operator: &str, active: bool) -> Result<()> {
+        let op = valid_operator(operator)?;
+        self.core.safety.operator_set_conservative(active, op)
+    }
+
+    pub fn set_operator_chaos(&self, operator: &str, active: bool) -> Result<()> {
+        valid_operator(operator)?;
+        self.core.safety.set_chaos_source(ChaosSource::Operator, active)?;
+        Ok(())
+    }
+
+    pub fn register_zone_link(&self, src: &str, dst: &str, zone: &str) -> Result<()> {
+        self.core.zones.register_link(&LinkId::new(src, dst), zone)
+    }
+
+    /// Validated, audited-before-applied config reload. Returns changed field names.
+    pub fn reload_config(&self, operator: &str, toml_text: &str) -> Result<Vec<String>> {
+        let op = valid_operator(operator)?;
+        let c = &self.core;
+        let (new, changed) = c.cfg.prepare(toml_text)?;
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        c.audit.append(&AuditEvent::ConfigReloaded { version: c.cfg.version() + 1, changed: changed.clone(), operator: op.into() })?;
+        c.cfg.commit(new)?;
+        c.safety.bump_version()?;
+        Ok(changed)
+    }
+}
+EOF
+cargo build 2>&1 | tail -60
+
