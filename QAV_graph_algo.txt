@@ -1,0 +1,556 @@
+cd /home/squire/qib
+cat > src/graph.rs <<'EOF'
+//! Topology + path algorithms.
+//!
+//! Costs are passed as a slice aligned with `Graph::edges`, computed once per
+//! routing call from a single consistent twin snapshot. An edge whose cost is
+//! not finite and >= 0 (INFINITY, NaN, negative) is treated as ABSENT, so no
+//! returned path can ever contain a rejected/quarantined hop.
+use crate::errors::{Result, VerifierError};
+use crate::twin::LinkId;
+use serde::Deserialize;
+use std::cmp::Ordering;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+
+#[derive(Clone, Copy, Debug)]
+pub struct Edge {
+    pub from: usize,
+    pub to: usize,
+    pub weight: f64,
+}
+
+#[derive(Deserialize)]
+struct GraphJson {
+    edges: Vec<(String, String, f64)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Graph {
+    nodes: Vec<String>,
+    index: HashMap<String, usize>,
+    edges: Vec<Edge>,
+    adj: Vec<Vec<usize>>,
+    links: Vec<LinkId>,
+    id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Path {
+    pub nodes: Vec<usize>,
+    pub edges: Vec<usize>,
+    pub cost: f64,
+}
+
+impl Graph {
+    /// Static weights must be finite and > 0; no self-loops; no duplicate edges.
+    pub fn new(edges: Vec<(String, String, f64)>) -> Result<Self> {
+        let mut nodes: Vec<String> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut out: Vec<Edge> = Vec::with_capacity(edges.len());
+        let mut links = Vec::with_capacity(edges.len());
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        let mut h = DefaultHasher::new();
+        for (s, d, w) in &edges {
+            if !(w.is_finite() && *w > 0.0) {
+                return Err(VerifierError::Graph(format!("edge {s}->{d}: weight {w} must be finite and > 0")));
+            }
+            if s == d {
+                return Err(VerifierError::Graph(format!("self-loop on {s}")));
+            }
+            let mut idx = |name: &String| -> usize {
+                if let Some(&i) = index.get(name) {
+                    return i;
+                }
+                nodes.push(name.clone());
+                index.insert(name.clone(), nodes.len() - 1);
+                nodes.len() - 1
+            };
+            let (a, b) = (idx(s), idx(d));
+            if !seen.insert((a, b)) {
+                return Err(VerifierError::Graph(format!("duplicate edge {s}->{d}")));
+            }
+            out.push(Edge { from: a, to: b, weight: *w });
+            links.push(LinkId::new(s, d));
+            (s, d, w.to_bits()).hash(&mut h);
+        }
+        let mut adj = vec![Vec::new(); nodes.len()];
+        for (i, e) in out.iter().enumerate() {
+            adj[e.from].push(i);
+        }
+        Ok(Self { nodes, index, edges: out, adj, links, id: h.finish() })
+    }
+
+    pub fn from_json(s: &str) -> Result<Self> {
+        let g: GraphJson = serde_json::from_str(s).map_err(|e| VerifierError::Graph(e.to_string()))?;
+        Self::new(g.edges)
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+    pub fn node(&self, name: &str) -> Option<usize> {
+        self.index.get(name).copied()
+    }
+    pub fn node_name(&self, i: usize) -> &str {
+        &self.nodes[i]
+    }
+    pub fn edge(&self, i: usize) -> &Edge {
+        &self.edges[i]
+    }
+    pub fn edge_links(&self) -> &[LinkId] {
+        &self.links
+    }
+    pub fn edge_weights(&self) -> Vec<f64> {
+        self.edges.iter().map(|e| e.weight).collect()
+    }
+
+    /// Number of ordered (src != dst) node pairs connected via edges for which `usable(edge_idx)`.
+    pub fn reachable_pairs<F: Fn(usize) -> bool>(&self, usable: F) -> usize {
+        let mut total = 0;
+        for s in 0..self.nodes.len() {
+            let mut seen = vec![false; self.nodes.len()];
+            let mut stack = vec![s];
+            seen[s] = true;
+            while let Some(u) = stack.pop() {
+                for &e in &self.adj[u] {
+                    let v = self.edges[e].to;
+                    if usable(e) && !seen[v] {
+                        seen[v] = true;
+                        stack.push(v);
+                    }
+                }
+            }
+            total += seen.iter().filter(|&&b| b).count() - 1;
+        }
+        total
+    }
+}
+
+#[inline]
+fn usable(c: f64) -> bool {
+    c.is_finite() && c >= 0.0
+}
+
+#[derive(Copy, Clone)]
+struct Item {
+    cost: f64,
+    node: usize,
+}
+impl PartialEq for Item {
+    fn eq(&self, o: &Self) -> bool {
+        self.cost.total_cmp(&o.cost) == Ordering::Equal && self.node == o.node
+    }
+}
+impl Eq for Item {}
+impl Ord for Item {
+    fn cmp(&self, o: &Self) -> Ordering {
+        o.cost.total_cmp(&self.cost).then_with(|| o.node.cmp(&self.node)) // min-heap
+    }
+}
+impl PartialOrd for Item {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+fn dijkstra(
+    g: &Graph,
+    costs: &[f64],
+    src: usize,
+    dst: usize,
+    banned_nodes: &[bool],
+    banned_edges: &HashSet<usize>,
+) -> Option<Path> {
+    let n = g.nodes.len();
+    let mut dist = vec![f64::INFINITY; n];
+    let mut prev: Vec<Option<usize>> = vec![None; n]; // edge used to reach node
+    let mut heap = BinaryHeap::new();
+    dist[src] = 0.0;
+    heap.push(Item { cost: 0.0, node: src });
+    while let Some(Item { cost, node }) = heap.pop() {
+        if cost > dist[node] {
+            continue;
+        }
+        if node == dst {
+            break;
+        }
+        for &e in &g.adj[node] {
+            let c = costs[e];
+            let v = g.edges[e].to;
+            if !usable(c) || banned_edges.contains(&e) || banned_nodes[v] {
+                continue;
+            }
+            let nc = cost + c;
+            if nc < dist[v] {
+                dist[v] = nc;
+                prev[v] = Some(e);
+                heap.push(Item { cost: nc, node: v });
+            }
+        }
+    }
+    if !dist[dst].is_finite() {
+        return None;
+    }
+    let mut edges = Vec::new();
+    let mut cur = dst;
+    while cur != src {
+        let e = prev[cur]?;
+        edges.push(e);
+        cur = g.edges[e].from;
+    }
+    edges.reverse();
+    let mut nodes = vec![src];
+    nodes.extend(edges.iter().map(|&e| g.edges[e].to));
+    Some(Path { nodes, edges, cost: dist[dst] })
+}
+
+pub fn shortest_path(g: &Graph, costs: &[f64], src: usize, dst: usize) -> Option<Path> {
+    if src == dst || costs.len() != g.edges.len() {
+        return None;
+    }
+    dijkstra(g, costs, src, dst, &vec![false; g.nodes.len()], &HashSet::new())
+}
+
+fn path_cost(costs: &[f64], edges: &[usize]) -> f64 {
+    edges.iter().map(|&e| costs[e]).sum()
+}
+
+/// Yen's k loopless shortest paths. Never returns a path containing an unusable edge.
+pub fn yen_k_shortest(g: &Graph, costs: &[f64], src: usize, dst: usize, k: usize) -> Vec<Path> {
+    if k == 0 || src == dst || costs.len() != g.edges.len() {
+        return Vec::new();
+    }
+    let Some(first) = shortest_path(g, costs, src, dst) else { return Vec::new() };
+    let mut a: Vec<Path> = vec![first];
+    let mut b: Vec<Path> = Vec::new();
+    while a.len() < k {
+        let prev = a[a.len() - 1].clone();
+        for i in 0..prev.nodes.len() - 1 {
+            let spur = prev.nodes[i];
+            let root_nodes = &prev.nodes[..=i];
+            let root_edges = &prev.edges[..i];
+            let mut banned_edges = HashSet::new();
+            for p in a.iter().chain(b.iter()) {
+                if p.nodes.len() > i && p.nodes[..=i] == *root_nodes && p.edges.len() > i {
+                    banned_edges.insert(p.edges[i]);
+                }
+            }
+            let mut banned_nodes = vec![false; g.nodes.len()];
+            for &r in &root_nodes[..i] {
+                banned_nodes[r] = true;
+            }
+            if let Some(sp) = dijkstra(g, costs, spur, dst, &banned_nodes, &banned_edges) {
+                let mut edges = root_edges.to_vec();
+                edges.extend_from_slice(&sp.edges);
+                if a.iter().chain(b.iter()).any(|p| p.edges == edges) {
+                    continue;
+                }
+                let mut nodes = root_nodes.to_vec();
+                nodes.extend_from_slice(&sp.nodes[1..]);
+                let cost = path_cost(costs, &edges);
+                b.push(Path { nodes, edges, cost });
+            }
+        }
+        if b.is_empty() {
+            break;
+        }
+        let (bi, _) = b
+            .iter()
+            .enumerate()
+            .min_by(|(_, x), (_, y)| x.cost.total_cmp(&y.cost).then_with(|| x.edges.cmp(&y.edges)))
+            .expect("b is non-empty");
+        a.push(b.swap_remove(bi));
+    }
+    a
+}
+
+/// Up to `k` pairwise edge-disjoint paths of minimum total cost (successive
+/// shortest paths on a unit-capacity min-cost flow; generalises Suurballe, which
+/// only covers k = 2). Used for diversity at escalation stage >= 3.
+pub fn edge_disjoint_paths(g: &Graph, costs: &[f64], src: usize, dst: usize, k: usize) -> Vec<Path> {
+    if k == 0 || src == dst || costs.len() != g.edges.len() {
+        return Vec::new();
+    }
+    let n = g.nodes.len();
+    // arc 2*i: forward for usable edge i-th; arc 2*i+1: reverse
+    let mut arc_to = Vec::new();
+    let mut arc_cost = Vec::new();
+    let mut arc_cap: Vec<i32> = Vec::new();
+    let mut arc_edge = Vec::new();
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (e, edge) in g.edges.iter().enumerate() {
+        if !usable(costs[e]) {
+            continue;
+        }
+        let a = arc_to.len();
+        arc_to.push(edge.to);
+        arc_cost.push(costs[e]);
+        arc_cap.push(1);
+        arc_edge.push(e);
+        out[edge.from].push(a);
+        arc_to.push(edge.from);
+        arc_cost.push(-costs[e]);
+        arc_cap.push(0);
+        arc_edge.push(e);
+        out[edge.to].push(a + 1);
+    }
+    let mut flow = 0;
+    while flow < k {
+        let mut dist = vec![f64::INFINITY; n];
+        let mut prev_arc: Vec<Option<usize>> = vec![None; n];
+        dist[src] = 0.0;
+        for _ in 0..n {
+            let mut changed = false;
+            for u in 0..n {
+                if !dist[u].is_finite() {
+                    continue;
+                }
+                for &a in &out[u] {
+                    if arc_cap[a] > 0 && dist[u] + arc_cost[a] < dist[arc_to[a]] - 1e-12 {
+                        dist[arc_to[a]] = dist[u] + arc_cost[a];
+                        prev_arc[arc_to[a]] = Some(a);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if !dist[dst].is_finite() {
+            break;
+        }
+        let mut cur = dst;
+        while cur != src {
+            let Some(a) = prev_arc[cur] else { return Vec::new() };
+            arc_cap[a] -= 1;
+            arc_cap[a ^ 1] += 1;
+            cur = arc_to[a ^ 1];
+        }
+        flow += 1;
+    }
+    // Decompose the flow.
+    let mut used_out: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for a in (0..arc_to.len()).step_by(2) {
+        if arc_cap[a] == 0 {
+            used_out[arc_to[a + 1]].push(arc_edge[a]);
+        }
+    }
+    let mut paths = Vec::new();
+    for _ in 0..flow {
+        let mut cur = src;
+        let mut edges = Vec::new();
+        let mut steps = 0;
+        while cur != dst {
+            let Some(e) = used_out[cur].pop() else { break };
+            edges.push(e);
+            cur = g.edges[e].to;
+            steps += 1;
+            if steps > g.edges.len() {
+                break;
+            }
+        }
+        if cur == dst {
+            let mut nodes = vec![src];
+            nodes.extend(edges.iter().map(|&e| g.edges[e].to));
+            let cost = path_cost(costs, &edges);
+            paths.push(Path { nodes, edges, cost });
+        }
+    }
+    paths.sort_by(|x, y| x.cost.total_cmp(&y.cost).then_with(|| x.edges.cmp(&y.edges)));
+    paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn g(edges: &[(&str, &str, f64)]) -> Graph {
+        Graph::new(edges.iter().map(|(a, b, w)| (a.to_string(), b.to_string(), *w)).collect()).unwrap()
+    }
+
+    fn names(g: &Graph, p: &Path) -> Vec<String> {
+        p.nodes.iter().map(|&i| g.node_name(i).to_string()).collect()
+    }
+
+    #[test]
+    fn construction_validates() {
+        assert!(Graph::new(vec![("A".into(), "B".into(), 0.0)]).is_err());
+        assert!(Graph::new(vec![("A".into(), "B".into(), f64::NAN)]).is_err());
+        assert!(Graph::new(vec![("A".into(), "A".into(), 1.0)]).is_err());
+        assert!(Graph::new(vec![("A".into(), "B".into(), 1.0), ("A".into(), "B".into(), 2.0)]).is_err());
+        assert!(Graph::from_json("not json").is_err());
+        let gr = Graph::from_json(r#"{"edges":[["A","B",1.0],["B","C",2.5]]}"#).unwrap();
+        assert_eq!((gr.node_count(), gr.edge_count()), (3, 2));
+    }
+
+    #[test]
+    fn shortest_path_and_unusable_edges_are_absent() {
+        let gr = g(&[("A", "B", 1.0), ("B", "D", 1.0), ("A", "C", 1.0), ("C", "D", 1.0), ("A", "D", 5.0)]);
+        let (a, d) = (gr.node("A").unwrap(), gr.node("D").unwrap());
+        let mut costs = gr.edge_weights();
+        assert_eq!(shortest_path(&gr, &costs, a, d).unwrap().cost, 2.0);
+        costs[1] = f64::INFINITY; // B->D
+        costs[3] = f64::NAN; // C->D
+        let p = shortest_path(&gr, &costs, a, d).unwrap();
+        assert_eq!(names(&gr, &p), vec!["A", "D"]);
+        costs[4] = -1.0; // negative also treated as absent
+        assert!(shortest_path(&gr, &costs, a, d).is_none());
+    }
+
+    #[test]
+    fn yen_diamond() {
+        let gr = g(&[("A", "B", 1.0), ("B", "D", 1.0), ("A", "C", 2.0), ("C", "D", 2.0), ("A", "D", 10.0)]);
+        let (a, d) = (gr.node("A").unwrap(), gr.node("D").unwrap());
+        let ps = yen_k_shortest(&gr, &gr.edge_weights(), a, d, 5);
+        let cs: Vec<f64> = ps.iter().map(|p| p.cost).collect();
+        assert_eq!(cs, vec![2.0, 4.0, 10.0]);
+    }
+
+    #[test]
+    fn disjoint_diamond_and_trap() {
+        // Classic trap: greedy shortest path blocks the 2-disjoint solution.
+        let gr = g(&[
+            ("S", "A", 1.0), ("A", "B", 1.0), ("B", "T", 1.0), // shortest, uses the bridge A->B
+            ("S", "B", 2.0), ("A", "T", 2.0),
+        ]);
+        let (s, t) = (gr.node("S").unwrap(), gr.node("T").unwrap());
+        let ps = edge_disjoint_paths(&gr, &gr.edge_weights(), s, t, 2);
+        assert_eq!(ps.len(), 2, "min-cost flow must find the disjoint pair a greedy search misses");
+        let total: f64 = ps.iter().map(|p| p.cost).sum();
+        assert!((total - 8.0).abs() < 1e-9, "S-A-T (3) + S-B-T (3) = 6? got {total}");
+    }
+
+    /// All simple src->dst paths over usable edges (brute force oracle).
+    fn all_simple_paths(gr: &Graph, costs: &[f64], s: usize, t: usize) -> Vec<(Vec<usize>, f64)> {
+        fn dfs(gr: &Graph, costs: &[f64], u: usize, t: usize, vis: &mut Vec<bool>, cur: &mut Vec<usize>, out: &mut Vec<(Vec<usize>, f64)>) {
+            if u == t {
+                out.push((cur.clone(), cur.iter().map(|&e| costs[e]).sum()));
+                return;
+            }
+            for e in 0..gr.edge_count() {
+                let ed = gr.edge(e);
+                if ed.from == u && usable(costs[e]) && !vis[ed.to] {
+                    vis[ed.to] = true;
+                    cur.push(e);
+                    dfs(gr, costs, ed.to, t, vis, cur, out);
+                    cur.pop();
+                    vis[ed.to] = false;
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut vis = vec![false; gr.node_count()];
+        vis[s] = true;
+        dfs(gr, costs, s, t, &mut vis, &mut Vec::new(), &mut out);
+        out
+    }
+
+    fn arb_graph() -> impl Strategy<Value = (Graph, Vec<f64>)> {
+        (3usize..=6).prop_flat_map(|n| {
+            let pairs: Vec<(usize, usize)> = (0..n).flat_map(|i| (0..n).filter(move |&j| j != i).map(move |j| (i, j))).collect();
+            let m = pairs.len();
+            (
+                Just(pairs),
+                proptest::collection::vec(proptest::option::weighted(0.45, 1u8..=9), m),
+                proptest::collection::vec(prop_oneof![8 => Just(false), 2 => Just(true)], m),
+            )
+                .prop_map(move |(pairs, w, bad)| {
+                    let mut edges = Vec::new();
+                    let mut costs = Vec::new();
+                    for ((i, j), (w, bad)) in pairs.iter().zip(w.iter().zip(bad.iter())) {
+                        if let Some(w) = w {
+                            edges.push((format!("n{i}"), format!("n{j}"), *w as f64 / 2.0));
+                            costs.push(if *bad { f64::INFINITY } else { *w as f64 / 2.0 });
+                        }
+                    }
+                    if edges.is_empty() {
+                        edges.push(("n0".into(), "n1".into(), 1.0));
+                        costs.push(1.0);
+                    }
+                    (Graph::new(edges).unwrap(), costs)
+                })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+
+        #[test]
+        fn yen_matches_brute_force((gr, costs) in arb_graph(), k in 1usize..=6) {
+            let (s, t) = (0usize, gr.node_count() - 1);
+            prop_assume!(s != t);
+            let got = yen_k_shortest(&gr, &costs, s, t, k);
+            let mut want = all_simple_paths(&gr, &costs, s, t);
+            want.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let expect_n = want.len().min(k);
+            prop_assert_eq!(got.len(), expect_n);
+            let mut seen = HashSet::new();
+            for (i, p) in got.iter().enumerate() {
+                prop_assert!((p.cost - want[i].1).abs() < 1e-9, "rank {} cost {} vs oracle {}", i, p.cost, want[i].1);
+                prop_assert!(seen.insert(p.edges.clone()), "duplicate path");
+                // simple, connected, endpoints, no unusable edge
+                prop_assert_eq!(p.nodes[0], s);
+                prop_assert_eq!(*p.nodes.last().unwrap(), t);
+                let uniq: HashSet<_> = p.nodes.iter().collect();
+                prop_assert_eq!(uniq.len(), p.nodes.len());
+                for &e in &p.edges { prop_assert!(usable(costs[e])); }
+            }
+        }
+
+        #[test]
+        fn disjoint_matches_brute_force((gr, costs) in arb_graph(), k in 1usize..=3) {
+            let (s, t) = (0usize, gr.node_count() - 1);
+            prop_assume!(s != t);
+            let got = edge_disjoint_paths(&gr, &costs, s, t, k);
+            // validity
+            let mut used = HashSet::new();
+            for p in &got {
+                prop_assert_eq!(p.nodes[0], s);
+                prop_assert_eq!(*p.nodes.last().unwrap(), t);
+                for &e in &p.edges {
+                    prop_assert!(usable(costs[e]));
+                    prop_assert!(used.insert(e), "edge reused across paths");
+                }
+            }
+            // optimality: max cardinality (<=k), then min total cost, vs brute force
+            let paths = all_simple_paths(&gr, &costs, s, t);
+            fn best(paths: &[(Vec<usize>, f64)], start: usize, taken: &mut Vec<usize>, used: &mut HashSet<usize>, k: usize, out: &mut (usize, f64)) {
+                let cost: f64 = taken.iter().map(|&i| paths[i].1).sum();
+                if taken.len() > out.0 || (taken.len() == out.0 && cost < out.1) { *out = (taken.len(), cost); }
+                if taken.len() == k { return; }
+                for i in start..paths.len() {
+                    if paths[i].0.iter().all(|e| !used.contains(e)) {
+                        for e in &paths[i].0 { used.insert(*e); }
+                        taken.push(i);
+                        best(paths, i + 1, taken, used, k, out);
+                        taken.pop();
+                        for e in &paths[i].0 { used.remove(e); }
+                    }
+                }
+            }
+            let mut out = (0usize, f64::INFINITY);
+            best(&paths, 0, &mut Vec::new(), &mut HashSet::new(), k, &mut out);
+            prop_assert_eq!(got.len(), out.0);
+            if out.0 > 0 {
+                let total: f64 = got.iter().map(|p| p.cost).sum();
+                prop_assert!((total - out.1).abs() < 1e-9, "total {} vs optimal {}", total, out.1);
+            }
+        }
+    }
+}
+EOF
+echo ok
+
+Response:
+
+{"returncode":0,"stdout":"ok\n","stderr":""}
