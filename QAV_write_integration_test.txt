@@ -1,0 +1,589 @@
+cd /home/squire/qib
+mkdir -p tests/common
+cat > tests/common/mod.rs <<'EOF'
+#![allow(dead_code)]
+use ed25519_dalek::SigningKey;
+use qib_verifier::audit::MemoryAuditSink;
+use qib_verifier::clock::ManualClock;
+use qib_verifier::config::RuntimeConfig;
+use qib_verifier::graph::Graph;
+use qib_verifier::sentinel::SignedProbe;
+use qib_verifier::verifier::{ControlPlane, DataPlane, Verifier};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+pub const BASE_MS: u64 = 1_793_750_400_000; // 2026-11-04T00:00:00Z
+
+pub struct Fx {
+    pub dp: DataPlane,
+    pub cp: ControlPlane,
+    pub audit: Arc<MemoryAuditSink>,
+    pub clock: Arc<ManualClock>,
+    pub sk: SigningKey,
+    nonce: AtomicU64,
+}
+
+pub fn fx() -> Fx {
+    fx_with(RuntimeConfig::default())
+}
+
+pub fn fx_with(cfg: RuntimeConfig) -> Fx {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let clock = Arc::new(ManualClock::new(BASE_MS));
+    let sk = SigningKey::from_bytes(&[42u8; 32]);
+    let (dp, cp) = Verifier::build(cfg, sk.verifying_key(), audit.clone(), clock.clone()).unwrap();
+    Fx { dp, cp, audit, clock, sk, nonce: AtomicU64::new(1) }
+}
+
+impl Fx {
+    pub fn probe(&self, src: &str, dst: &str, fidelity: f64) -> SignedProbe {
+        let n = self.nonce.fetch_add(1, Ordering::SeqCst);
+        SignedProbe::sign(&self.sk, src, dst, fidelity, n, self.clock.unix_ms_now())
+    }
+    pub fn warm(&self, src: &str, dst: &str, fidelity: f64) {
+        for _ in 0..12 {
+            self.dp.observe(src, dst, fidelity).unwrap();
+        }
+    }
+    /// Alternate between hi/lo to create a genuinely uncertain link.
+    pub fn flaky(&self, src: &str, dst: &str, hi: f64, lo: f64) {
+        for i in 0..40 {
+            self.dp.observe(src, dst, if i % 2 == 0 { hi } else { lo }).unwrap();
+        }
+    }
+}
+
+pub trait ClockExt {
+    fn unix_ms_now(&self) -> u64;
+}
+impl ClockExt for ManualClock {
+    fn unix_ms_now(&self) -> u64 {
+        use qib_verifier::clock::Clock;
+        self.unix_ms()
+    }
+}
+
+pub fn diamond() -> Graph {
+    Graph::new(vec![
+        ("A".into(), "B".into(), 1.0),
+        ("B".into(), "D".into(), 1.0),
+        ("A".into(), "C".into(), 1.0),
+        ("C".into(), "D".into(), 1.0),
+        ("A".into(), "D".into(), 5.0),
+    ])
+    .unwrap()
+}
+
+pub fn line() -> Graph {
+    Graph::new(vec![("A".into(), "B".into(), 1.0), ("B".into(), "D".into(), 1.0)]).unwrap()
+}
+
+/// Warm all diamond links: via-B path better than via-C.
+pub fn warm_diamond(f: &Fx) {
+    f.warm("A", "B", 0.99);
+    f.warm("B", "D", 0.99);
+    f.warm("A", "C", 0.92);
+    f.warm("C", "D", 0.92);
+    f.warm("A", "D", 0.80);
+}
+
+pub fn uses_hop(paths: &[qib_verifier::RoutedPath], a: &str, b: &str) -> bool {
+    paths.iter().any(|p| p.nodes.windows(2).any(|w| w[0] == a && w[1] == b))
+}
+EOF
+cat > tests/scenarios.rs <<'EOF'
+mod common;
+use common::*;
+use qib_verifier::audit::AuditEvent;
+use qib_verifier::cache::RouteMode;
+use qib_verifier::config::*;
+use qib_verifier::VerifierError;
+
+#[test]
+fn ai_prefers_the_higher_fidelity_path() {
+    let f = fx();
+    warm_diamond(&f);
+    let r = f.dp.route("A", "D", 1, &diamond()).unwrap();
+    assert_eq!(r.mode, RouteMode::Ai);
+    assert_eq!(r.paths[0].nodes, vec!["A", "B", "D"]);
+}
+
+// ── Regression: v17 sentinel never quarantined (probe "success" was always true) ──
+#[test]
+fn failed_probe_on_a_link_the_ai_trusts_quarantines_it() {
+    let f = fx();
+    warm_diamond(&f);
+    let out = f.dp.ingest_probe(&f.probe("B", "D", 0.30)).unwrap();
+    assert!(!out.passed);
+    assert!(out.quarantined, "v17 bug: quarantine never triggered");
+    assert!(f.dp.is_quarantined("B", "D").unwrap());
+    let r = f.dp.route("A", "D", 5, &diamond()).unwrap();
+    assert!(!uses_hop(&r.paths, "B", "D"));
+    assert!(f.audit.events().iter().any(|e| matches!(e, AuditEvent::LinkQuarantined { src, dst, .. } if src == "B" && dst == "D")));
+    // the probe also taught the twin
+    assert!(f.dp.link("B", "D").unwrap().unwrap().mean < 0.99);
+}
+
+#[test]
+fn passing_probe_does_not_quarantine() {
+    let f = fx();
+    warm_diamond(&f);
+    let out = f.dp.ingest_probe(&f.probe("B", "D", 0.95)).unwrap();
+    assert!(out.passed && !out.quarantined);
+}
+
+#[test]
+fn failed_probe_on_a_link_the_ai_already_distrusts_does_not_quarantine() {
+    let f = fx();
+    f.warm("B", "D", 0.60); // twin already believes the link is bad
+    let out = f.dp.ingest_probe(&f.probe("B", "D", 0.30)).unwrap();
+    assert!(!out.passed && !out.quarantined);
+}
+
+#[test]
+fn probe_for_unknown_link_does_not_quarantine() {
+    let f = fx();
+    let out = f.dp.ingest_probe(&f.probe("X", "Y", 0.1)).unwrap();
+    assert!(!out.quarantined && out.predicted.is_none());
+}
+
+// ── Regression: v17 routing cache served quarantined links for the TTL ──
+#[test]
+fn cached_routes_never_survive_a_quarantine() {
+    let f = fx();
+    warm_diamond(&f);
+    let g = diamond();
+    assert!(!f.dp.route("A", "D", 1, &g).unwrap().from_cache);
+    let hit = f.dp.route("A", "D", 1, &g).unwrap();
+    assert!(hit.from_cache && hit.paths[0].nodes == vec!["A", "B", "D"]);
+    f.dp.ingest_probe(&f.probe("B", "D", 0.2)).unwrap();
+    let after = f.dp.route("A", "D", 1, &g).unwrap();
+    assert!(!after.from_cache);
+    assert_eq!(after.paths[0].nodes, vec!["A", "C", "D"]);
+    // operator lifts it: route changes back immediately, not after TTL
+    f.cp.lift_quarantine("alice", "B", "D").unwrap();
+    f.dp.observe("B", "D", 0.99).unwrap();
+    for _ in 0..30 {
+        f.dp.observe("B", "D", 0.99).unwrap();
+    }
+    assert_eq!(f.dp.route("A", "D", 1, &g).unwrap().paths[0].nodes, vec!["A", "B", "D"]);
+}
+
+#[test]
+fn cache_is_invalidated_when_a_link_crosses_the_reject_gate() {
+    let f = fx();
+    warm_diamond(&f);
+    let g = diamond();
+    f.dp.route("A", "D", 1, &g).unwrap();
+    assert!(f.dp.route("A", "D", 1, &g).unwrap().from_cache);
+    // make B->D wildly inconsistent: std crosses the reject threshold
+    for i in 0..40 {
+        f.dp.observe("B", "D", if i % 2 == 0 { 0.99 } else { 0.30 }).unwrap();
+    }
+    let r = f.dp.route("A", "D", 1, &g).unwrap();
+    assert!(!r.from_cache);
+    assert!(!uses_hop(&r.paths, "B", "D"));
+}
+
+#[test]
+fn forged_tampered_stale_and_replayed_probes_cannot_quarantine() {
+    let f = fx();
+    warm_diamond(&f);
+    let wrong = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let forged = qib_verifier::sentinel::SignedProbe::sign(&wrong, "B", "D", 0.1, 900, BASE_MS);
+    assert!(matches!(f.dp.ingest_probe(&forged), Err(VerifierError::ProbeRejected(_))));
+
+    let mut tampered = f.probe("B", "D", 0.95);
+    tampered.actual_fidelity = 0.1; // attacker lowers it after signing
+    assert!(f.dp.ingest_probe(&tampered).is_err());
+
+    f.clock.advance_secs(3600);
+    let mut stale = f.probe("B", "D", 0.1);
+    stale.timestamp_ms -= 3_600_000;
+    assert!(f.dp.ingest_probe(&stale).is_err());
+
+    let ok = f.probe("A", "B", 0.99);
+    f.dp.ingest_probe(&ok).unwrap();
+    assert!(f.dp.ingest_probe(&ok).is_err(), "replay");
+
+    assert!(!f.dp.is_quarantined("B", "D").unwrap());
+    assert_eq!(f.dp.metrics().probes_rejected_total, 4);
+    let rejects = f.audit.events().iter().filter(|e| matches!(e, AuditEvent::ProbeRejected { .. })).count();
+    assert_eq!(rejects, 4);
+}
+
+#[test]
+fn uncertain_links_are_avoided_and_total_uncertainty_falls_back_to_static_safe_path() {
+    let f = fx();
+    warm_diamond(&f);
+    f.flaky("A", "B", 0.99, 0.40); // via-B becomes uncertain
+    let g = diamond();
+    let r = f.dp.route("A", "D", 1, &g).unwrap();
+    assert_eq!((r.mode, r.paths[0].nodes.clone()), (RouteMode::Ai, vec!["A".into(), "C".into(), "D".into()]));
+    assert!(f.dp.metrics().edges_rejected_uncertainty_total > 0);
+
+    // now everything is uncertain => no admissible AI path => static fallback
+    for (a, b) in [("A", "C"), ("C", "D"), ("A", "D"), ("B", "D")] {
+        f.flaky(a, b, 0.99, 0.40);
+    }
+    let r = f.dp.route("A", "D", 1, &g).unwrap();
+    assert_eq!(r.mode, RouteMode::SafeFallback);
+    assert_eq!(r.paths[0].nodes, vec!["A", "B", "D"]); // static cost 2 < 5
+    assert_eq!(f.dp.metrics().safe_fallbacks_total, 1);
+}
+
+#[test]
+fn quarantine_is_honoured_even_by_the_static_fallback() {
+    let f = fx();
+    warm_diamond(&f);
+    f.dp.ingest_probe(&f.probe("B", "D", 0.2)).unwrap();
+    f.dp.ingest_probe(&f.probe("C", "D", 0.2)).unwrap();
+    f.dp.ingest_probe(&f.probe("A", "D", 0.2)).unwrap();
+    assert!(matches!(f.dp.route("A", "D", 1, &diamond()), Err(VerifierError::NoPath(_, _))));
+}
+
+#[test]
+fn conservative_mode_tightens_and_invalidates_cache() {
+    let f = fx();
+    f.warm("A", "B", 0.99);
+    for i in 0..40 {
+        f.dp.observe("B", "D", if i % 2 == 0 { 0.85 } else { 0.65 }).unwrap(); // std ≈ 0.10
+    }
+    let v = f.dp.link("B", "D").unwrap().unwrap();
+    assert!(v.std > 0.08 && v.std < 0.15, "fixture std {}", v.std);
+    assert!(v.safety_tax && !v.path_reject);
+    let g = line();
+    let r = f.dp.route("A", "D", 1, &g).unwrap();
+    assert_eq!(r.mode, RouteMode::Ai);
+    assert!(f.dp.route("A", "D", 1, &g).unwrap().from_cache);
+
+    f.cp.set_conservative("op1", true).unwrap();
+    assert!(f.dp.link("B", "D").unwrap().unwrap().path_reject);
+    let r = f.dp.route("A", "D", 1, &g).unwrap();
+    assert!(!r.from_cache);
+    assert_eq!(r.mode, RouteMode::SafeFallback, "conservative rejects std 0.10; static path used");
+    assert!(f.audit.events().contains(&AuditEvent::ConservativeModeChanged { active: true, operator: "op1".into() }));
+}
+
+#[test]
+fn diversity_trip_enters_safe_mode_and_only_an_operator_restores_ai() {
+    let f = fx();
+    for i in 0..5 {
+        f.warm(&format!("X{i}"), "Y", 0.95);
+    }
+    f.warm_all_diamond();
+    for i in 0..5 {
+        f.dp.compare_and_audit(&format!("X{i}"), "Y", 0.05).unwrap(); // reality ≠ prediction
+    }
+    let v = f.dp.safety_view().unwrap();
+    assert!(!v.ai_enabled && v.stage == 4);
+    let r = f.dp.route("A", "D", 1, &diamond()).unwrap();
+    assert_eq!(r.mode, RouteMode::Safe);
+    assert_eq!(r.paths[0].nodes, vec!["A", "B", "D"]);
+    assert_eq!(f.dp.metrics().diversity_breaker_triggered_total, 1);
+
+    // good data does not re-enable the AI
+    for _ in 0..50 {
+        f.dp.compare_and_audit("X0", "Y", 0.95).unwrap();
+    }
+    assert!(!f.dp.safety_view().unwrap().ai_enabled);
+
+    assert_eq!(f.cp.reset_breaker("  "), Err(VerifierError::OperatorRequired));
+    f.cp.reset_breaker("alice").unwrap();
+    assert!(f.dp.safety_view().unwrap().ai_enabled);
+    assert_eq!(f.dp.route("A", "D", 1, &diamond()).unwrap().mode, RouteMode::Ai);
+    assert!(f.audit.events().contains(&AuditEvent::HumanReset { operator: "alice".into() }));
+}
+
+#[test]
+fn drift_escalation_ladder_reaches_diverse_conservative_routing_and_chaos_clears() {
+    let f = fx();
+    warm_diamond(&f);
+    let mut mesh_requested = false;
+    for _cycle in 0..3 {
+        for _ in 0..25 {
+            f.dp.compare_and_audit("A", "B", 0.10).unwrap(); // bad
+        }
+        assert_eq!(f.dp.learning_rate().unwrap(), LEARNING_RATE_THROTTLED, "overconfidence throttles learning");
+        for _ in 0..120 {
+            f.dp.compare_and_audit("A", "B", 0.99).unwrap(); // good: ewma falls, hysteresis re-arms
+        }
+        if f.dp.take_mesh_probe_request().unwrap().is_some() {
+            mesh_requested = true;
+        }
+    }
+    let v = f.dp.safety_view().unwrap();
+    assert!(v.ai_enabled && v.stage == 3 && v.conservative, "got {v:?}");
+    assert!(mesh_requested, "stage 2 must request a full-mesh probe from Rust");
+    assert_eq!(v.learning_rate, LEARNING_RATE_NORMAL, "throttle is reversible");
+
+    let r = f.dp.route("A", "D", 2, &diamond()).unwrap();
+    assert_eq!(r.mode, RouteMode::AiConservative);
+    assert_eq!(r.paths.len(), 2, "stage>=3 yields two edge-disjoint paths");
+    let (p0, p1) = (&r.paths[0].nodes, &r.paths[1].nodes);
+    assert_ne!(p0, p1);
+    assert!(!(uses_hop(&r.paths[..1], "B", "D") && uses_hop(&r.paths[1..], "B", "D")));
+    // 4th excursion trips the breaker
+    for _ in 0..25 {
+        f.dp.compare_and_audit("A", "B", 0.10).unwrap();
+    }
+    assert!(!f.dp.safety_view().unwrap().ai_enabled);
+}
+
+#[test]
+fn zone_quarantine_via_probes_and_operator_lift() {
+    let f = fx();
+    for d in ["H0", "H1", "H2", "H3"] {
+        f.cp.register_zone_link("R", d, "rack1").unwrap();
+        f.warm("R", d, 0.97);
+    }
+    assert!(f.dp.ingest_probe(&f.probe("R", "H0", 0.2)).unwrap().zone_quarantined.is_none());
+    assert!(f.dp.ingest_probe(&f.probe("R", "H1", 0.2)).unwrap().zone_quarantined.is_none());
+    let out = f.dp.ingest_probe(&f.probe("R", "H2", 0.2)).unwrap();
+    assert_eq!(out.zone_quarantined.as_deref(), Some("rack1"));
+    assert!(f.dp.is_quarantined("R", "H3").unwrap(), "healthy sibling quarantined with its zone");
+    assert!(f.audit.events().iter().any(|e| matches!(e, AuditEvent::ZoneQuarantined { zone, .. } if zone == "rack1")));
+    assert_eq!(f.cp.lift_zone("alice", "rack1").unwrap(), 4);
+    assert!(!f.dp.is_quarantined("R", "H3").unwrap());
+}
+
+#[test]
+fn operator_actions_fail_closed_when_audit_is_down() {
+    let f = fx();
+    warm_diamond(&f);
+    f.dp.ingest_probe(&f.probe("B", "D", 0.2)).unwrap();
+    f.audit.set_failing(true);
+    assert!(matches!(f.cp.lift_quarantine("alice", "B", "D"), Err(VerifierError::Audit(_))));
+    assert!(f.dp.is_quarantined("B", "D").unwrap(), "un-audited lift must not take effect");
+    assert!(f.cp.reload_config("alice", "safety_tax_multiplier = 3.0").is_err());
+    assert!(f.cp.set_conservative("alice", true).is_err());
+    // safety transitions still happen (and are counted) when audit is down
+    assert!(f.dp.ingest_probe(&f.probe("A", "B", 0.2)).is_ok());
+    assert!(f.dp.is_quarantined("A", "B").unwrap());
+    assert!(f.dp.metrics().audit_failures_total > 0);
+}
+
+#[test]
+fn config_reload_is_validated_audited_and_changes_behaviour() {
+    let f = fx();
+    f.warm("A", "B", 0.99);
+    for i in 0..40 {
+        f.dp.observe("B", "D", if i % 2 == 0 { 0.85 } else { 0.65 }).unwrap(); // std ≈ 0.10
+    }
+    let g = line();
+    assert_eq!(f.dp.route("A", "D", 1, &g).unwrap().mode, RouteMode::Ai);
+
+    // attempt to disable IMP-U: refused, nothing changes
+    assert!(f.cp.reload_config("mallory", "path_reject_threshold = 1.0").is_err());
+    assert!(f.cp.reload_config("mallory", "path_reject_threshold = 0.2\nsafety_tax_threshold = 0.3").is_err());
+    assert_eq!(f.dp.route("A", "D", 1, &g).unwrap().mode, RouteMode::Ai);
+
+    let changed = f.cp.reload_config("alice", "path_reject_threshold = 0.07").unwrap();
+    assert_eq!(changed, vec!["path_reject_threshold".to_string()]);
+    assert_eq!(f.dp.route("A", "D", 1, &g).unwrap().mode, RouteMode::SafeFallback);
+    assert!(f.audit.events().iter().any(|e| matches!(e, AuditEvent::ConfigReloaded { operator, .. } if operator == "alice")));
+}
+
+#[test]
+fn health_is_read_only_and_reflects_reality() {
+    let f = fx();
+    warm_diamond(&f);
+    let g = diamond();
+    f.dp.tick().unwrap();
+    let h1 = f.dp.health().unwrap();
+    let h2 = f.dp.health().unwrap();
+    assert_eq!(h1, h2, "health() must not mutate state");
+    assert!(h1.ai_active && (0.0..=1.0).contains(&h1.ai_trust_score));
+    assert!(h1.mean_uncertainty < 0.05, "warm links are confident, got {}", h1.mean_uncertainty);
+    assert_eq!(f.dp.safe_routing_coverage_pct(&g).unwrap(), 100.0);
+
+    // uncertainty rises over time => positive trend
+    f.clock.advance_secs(60);
+    f.flaky("A", "B", 0.99, 0.30);
+    f.flaky("B", "D", 0.99, 0.30);
+    f.dp.tick().unwrap();
+    let h3 = f.dp.health().unwrap();
+    assert!(h3.uncertainty_trend > 0.0, "trend {}", h3.uncertainty_trend);
+    assert!(h3.mean_uncertainty > h1.mean_uncertainty);
+    assert!(h3.ai_trust_score < h1.ai_trust_score);
+    assert_eq!(h3.top_n_worst_links.len(), 5);
+    assert!(h3.top_n_worst_links.windows(2).all(|w| w[0].1 >= w[1].1));
+    assert!(f.dp.safe_routing_coverage_pct(&g).unwrap() < 100.0);
+}
+
+#[test]
+fn uncertainty_spike_raises_chaos_through_tick() {
+    let f = fx();
+    for i in 0..4 {
+        f.warm("A", &format!("N{i}"), 0.95);
+    }
+    f.dp.tick().unwrap(); // baseline sample
+    for i in 0..4 {
+        f.flaky("A", &format!("N{i}"), 0.99, 0.2);
+    }
+    // a sudden new batch of unknown links pushes the mean up
+    for i in 4..12 {
+        f.dp.observe("Z", &format!("M{i}"), 0.9).unwrap(); // 1 sample => std 1.0
+    }
+    f.dp.tick().unwrap();
+    assert_eq!(f.dp.learning_rate().unwrap(), LEARNING_RATE_THROTTLED);
+    f.dp.tick().unwrap(); // no further rise
+    assert_eq!(f.dp.learning_rate().unwrap(), LEARNING_RATE_NORMAL);
+}
+
+#[test]
+fn invalid_inputs_are_rejected_not_absorbed() {
+    let f = fx();
+    for bad in [f64::NAN, f64::INFINITY, -0.5, 1.5] {
+        assert!(matches!(f.dp.observe("A", "B", bad), Err(VerifierError::InvalidObservation(_))));
+    }
+    assert!(f.dp.link("A", "B").unwrap().is_none(), "rejected input created no state");
+    assert!(matches!(f.dp.route("A", "ZZ", 1, &diamond()), Err(VerifierError::NoPath(_, _))));
+    assert!(matches!(f.dp.route("A", "A", 1, &diamond()), Err(VerifierError::NoPath(_, _))));
+    assert!(f.dp.compare_and_audit("A", "B", 0.5).is_err(), "no prediction exists yet");
+}
+
+#[test]
+fn audit_file_chain_survives_a_full_incident() {
+    use qib_verifier::audit::{verify_chain, FileAuditSink};
+    use qib_verifier::clock::ManualClock;
+    use qib_verifier::verifier::Verifier;
+    use std::sync::Arc;
+    let path = std::env::temp_dir().join(format!("qib_incident_{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let clock = Arc::new(ManualClock::new(BASE_MS));
+    let sink = Arc::new(FileAuditSink::open(&path, clock.clone()).unwrap());
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let (dp, cp) = Verifier::build(RuntimeConfig::default(), sk.verifying_key(), sink, clock.clone()).unwrap();
+    for _ in 0..12 {
+        dp.observe("B", "D", 0.98).unwrap();
+    }
+    let p = qib_verifier::sentinel::SignedProbe::sign(&sk, "B", "D", 0.2, 1, BASE_MS);
+    assert!(dp.ingest_probe(&p).unwrap().quarantined);
+    cp.lift_quarantine("alice", "B", "D").unwrap();
+    cp.reset_breaker("alice").unwrap();
+    let n = verify_chain(&path).unwrap();
+    assert!(n >= 3, "expected quarantine + lift + reset records, got {n}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("2026-11-04T00:00:00.000Z"));
+    let _ = std::fs::remove_file(&path);
+}
+
+trait FxExt {
+    fn warm_all_diamond(&self);
+}
+impl FxExt for Fx {
+    fn warm_all_diamond(&self) {
+        warm_diamond(self);
+    }
+}
+EOF
+cat > tests/properties.rs <<'EOF'
+//! Whole-system randomized tests through the public API only.
+mod common;
+use common::*;
+use proptest::prelude::*;
+use qib_verifier::graph::Graph;
+
+const NODES: [&str; 5] = ["n0", "n1", "n2", "n3", "n4"];
+
+fn complete_graph() -> Graph {
+    let mut e = Vec::new();
+    for (i, a) in NODES.iter().enumerate() {
+        for (j, b) in NODES.iter().enumerate() {
+            if i != j {
+                e.push((a.to_string(), b.to_string(), 1.0 + ((i + 2 * j) % 4) as f64));
+            }
+        }
+    }
+    Graph::new(e).unwrap()
+}
+
+#[derive(Debug, Clone)]
+enum Op {
+    Observe(usize, usize, f64),
+    Probe(usize, usize, f64),
+    Compare(usize, usize, f64),
+    Route(usize, usize, usize),
+    Tick(u64),
+    Conservative(bool),
+    Reset,
+}
+
+fn arb_op() -> impl Strategy<Value = Op> {
+    let n = NODES.len();
+    prop_oneof![
+        8 => (0..n, 0..n, 0.0f64..=1.0).prop_map(|(a, b, x)| Op::Observe(a, b, x)),
+        3 => (0..n, 0..n, prop_oneof![Just(0.1f64), Just(0.5), Just(0.95)]).prop_map(|(a, b, x)| Op::Probe(a, b, x)),
+        3 => (0..n, 0..n, 0.0f64..=1.0).prop_map(|(a, b, x)| Op::Compare(a, b, x)),
+        8 => (0..n, 0..n, 1usize..=4).prop_map(|(a, b, k)| Op::Route(a, b, k)),
+        1 => (1u64..400).prop_map(Op::Tick),
+        1 => any::<bool>().prop_map(Op::Conservative),
+        1 => Just(Op::Reset),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(120))]
+
+    /// For any interleaving of observations, probes, audits, ticks and operator
+    /// actions: no route ever contains a quarantined link (any mode, cached or not),
+    /// AI-mode routes never contain a link above the active reject threshold, and the
+    /// safety-state invariants hold after every step.
+    #[test]
+    fn no_route_ever_uses_a_forbidden_link(ops in proptest::collection::vec(arb_op(), 1..80)) {
+        let f = fx();
+        let g = complete_graph();
+        let cfg = qib_verifier::config::RuntimeConfig::default();
+        for op in ops {
+            match op {
+                Op::Observe(a, b, x) if a != b => { f.dp.observe(NODES[a], NODES[b], x).unwrap(); }
+                Op::Probe(a, b, x) if a != b => { let _ = f.dp.ingest_probe(&f.probe(NODES[a], NODES[b], x)); }
+                Op::Compare(a, b, x) if a != b => { let _ = f.dp.compare_and_audit(NODES[a], NODES[b], x); }
+                Op::Tick(s) => { f.clock.advance_secs(s); f.dp.tick().unwrap(); }
+                Op::Conservative(c) => { let _ = f.cp.set_conservative("op", c); }
+                Op::Reset => { f.cp.reset_breaker("op").unwrap(); }
+                Op::Route(a, b, k) if a != b => {
+                    let v = f.dp.safety_view().unwrap();
+                    for _ in 0..2 { // second call exercises the cache
+                        if let Ok(r) = f.dp.route(NODES[a], NODES[b], k, &g) {
+                            prop_assert!(!r.paths.is_empty() && r.paths.len() <= k);
+                            for p in &r.paths {
+                                prop_assert_eq!(p.nodes.first().unwrap(), NODES[a]);
+                                prop_assert_eq!(p.nodes.last().unwrap(), NODES[b]);
+                                prop_assert!(p.cost.is_finite() && p.cost >= 0.0);
+                                for w in p.nodes.windows(2) {
+                                    prop_assert!(!f.dp.is_quarantined(&w[0], &w[1]).unwrap(),
+                                        "quarantined hop {}->{} routed in {:?}", w[0], w[1], r.mode);
+                                    if r.mode == qib_verifier::cache::RouteMode::Ai {
+                                        let lv = f.dp.link(&w[0], &w[1]).unwrap().unwrap();
+                                        prop_assert!(lv.std <= cfg.path_reject_threshold + 1e-12,
+                                            "AI routed std {} on {}->{}", lv.std, w[0], w[1]);
+                                    }
+                                    if r.mode == qib_verifier::cache::RouteMode::AiConservative {
+                                        let lv = f.dp.link(&w[0], &w[1]).unwrap().unwrap();
+                                        prop_assert!(lv.std <= cfg.conservative_reject_threshold + 1e-12);
+                                    }
+                                }
+                            }
+                            prop_assert_eq!(f.dp.safety_view().unwrap().version, v.version, "route must not change safety state");
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let v = f.dp.safety_view().unwrap();
+            prop_assert_eq!(v.stage == 4, !v.ai_enabled);
+            if v.stage >= 3 { prop_assert!(v.conservative); }
+            let h = f.dp.health().unwrap();
+            prop_assert!((0.0..=1.0).contains(&h.ai_trust_score));
+            prop_assert!(h.mean_uncertainty.is_finite());
+        }
+    }
+}
+EOF
+cargo test --offline 2>&1 | grep -E "^(error|warning: unused)|-->|test result|FAILED|panicked|^test .*FAILED|^failures|Running" | head -60
+
+Response:
+
+{"returncode":0,"stdout":"     Running unittests src/lib.rs (target/debug/deps/qib_verifier-76a56c874deb7a3d)\ntest result: ok. 73 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s\n     Running tests/properties.rs (target/debug/deps/properties-b474a7032ce85f33)\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.98s\n     Running tests/scenarios.rs (target/debug/deps/scenarios-6fb14e02e45ca51b)\ntest config_reload_is_validated_audited_and_changes_behaviour ... FAILED\ntest quarantine_is_honoured_even_by_the_static_fallback ... FAILED\nfailures:\nthread 'config_reload_is_validated_audited_and_changes_behaviour' panicked at tests/scenarios.rs:287:79:\nthread 'quarantine_is_honoured_even_by_the_static_fallback' panicked at tests/scenarios.rs:148:5:\nfailures:\ntest result: FAILED. 18 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s\nerror: test failed, to rerun pass `--test scenarios`\n","stderr":""}
