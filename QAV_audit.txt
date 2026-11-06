@@ -1,0 +1,512 @@
+cd /home/squire/qib
+cat > src/audit.rs <<'EOF'
+//! Tamper-evident audit log.
+//!
+//! Each record carries `prev` (hash of the previous record) and `hash`
+//! (SHA-256 over seq|timestamp|prev|event). Editing, deleting or reordering any
+//! record breaks the chain, which `verify_chain` detects. Records are fsync'd.
+//! Appends are serialised (never dropped on contention, unlike v17's `try_lock`).
+//! Timestamps use a correct civil-date conversion (v17 stamped 2026-11-04 as 2026-11-22).
+use crate::clock::Clock;
+use crate::errors::{lock, Result, VerifierError};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+pub enum AuditEvent {
+    BreakerTripped { reason: String },
+    HumanReset { operator: String },
+    LinkQuarantined { src: String, dst: String, reason: String },
+    QuarantineLifted { src: String, dst: String, operator: String },
+    EscalationStageChanged { from: u64, to: u64, reason: String },
+    ProbeRejected { src: String, dst: String, reason: String },
+    DriftEarlyEscalation { ewma_delta: f64, mean_std: f64 },
+    ZoneQuarantined { zone: String, links_affected: usize },
+    ZoneLifted { zone: String, operator: String },
+    ConservativeModeChanged { active: bool, operator: String },
+    ChaosChanged { source: String, active: bool },
+    ConfigReloaded { version: u64, changed: Vec<String>, operator: String },
+}
+
+pub trait AuditSink: Send + Sync {
+    fn append(&self, event: &AuditEvent) -> Result<()>;
+}
+
+// ── Time formatting ─────────────────────────────────────────────────────────
+
+/// Days since 1970-01-01 → (year, month, day). Howard Hinnant's algorithm.
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+pub fn iso8601_from_unix_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (y, mo, d) = civil_from_days((secs / 86_400) as i64);
+    let rem = secs % 86_400;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y,
+        mo,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60,
+        ms % 1000
+    )
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    seq: u64,
+    ts_unix_ms: u64,
+    ts_iso: String,
+    prev: String,
+    event: AuditEvent,
+    hash: String,
+}
+
+fn record_hash(seq: u64, ts: u64, prev: &str, event: &AuditEvent) -> Result<String> {
+    let ev = serde_json::to_string(event).map_err(|e| VerifierError::Audit(e.to_string()))?;
+    let mut h = Sha256::new();
+    h.update(format!("{seq}|{ts}|{prev}|{ev}").as_bytes());
+    Ok(hex(&h.finalize()))
+}
+
+/// Verify a log file's hash chain. Returns the number of valid records.
+pub fn verify_chain(path: &Path) -> Result<u64> {
+    let f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(VerifierError::Audit(e.to_string())),
+    };
+    let mut prev = GENESIS.to_string();
+    let mut n = 0u64;
+    for (i, line) in BufReader::new(f).lines().enumerate() {
+        let line = line.map_err(|e| VerifierError::Audit(e.to_string()))?;
+        let r: Record = serde_json::from_str(&line)
+            .map_err(|e| VerifierError::Audit(format!("line {}: unparseable: {e}", i + 1)))?;
+        if r.seq != n || r.prev != prev {
+            return Err(VerifierError::Audit(format!("line {}: chain broken (seq/prev mismatch)", i + 1)));
+        }
+        if record_hash(r.seq, r.ts_unix_ms, &r.prev, &r.event)? != r.hash {
+            return Err(VerifierError::Audit(format!("line {}: hash mismatch (record altered)", i + 1)));
+        }
+        prev = r.hash;
+        n += 1;
+    }
+    Ok(n)
+}
+
+struct FileInner {
+    file: File,
+    seq: u64,
+    prev: String,
+}
+
+pub struct FileAuditSink {
+    inner: Mutex<FileInner>,
+    clock: Arc<dyn Clock>,
+}
+
+impl FileAuditSink {
+    /// Opens (or creates) the log. An existing log must verify; a tampered log
+    /// refuses to open (fail closed).
+    pub fn open(path: &Path, clock: Arc<dyn Clock>) -> Result<Self> {
+        let existing = verify_chain(path)?;
+        let prev = if existing == 0 {
+            GENESIS.to_string()
+        } else {
+            let f = File::open(path).map_err(|e| VerifierError::Audit(e.to_string()))?;
+            let last = BufReader::new(f)
+                .lines()
+                .filter_map(|l| l.ok())
+                .last()
+                .ok_or_else(|| VerifierError::Audit("empty log after verify".into()))?;
+            let r: Record = serde_json::from_str(&last).map_err(|e| VerifierError::Audit(e.to_string()))?;
+            r.hash
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| VerifierError::Audit(format!("{}: {e}", path.display())))?;
+        Ok(Self { inner: Mutex::new(FileInner { file, seq: existing, prev }), clock })
+    }
+}
+
+impl AuditSink for FileAuditSink {
+    fn append(&self, event: &AuditEvent) -> Result<()> {
+        let mut g = lock(&self.inner)?;
+        let ts = self.clock.unix_ms();
+        let hash = record_hash(g.seq, ts, &g.prev, event)?;
+        let rec = Record {
+            seq: g.seq,
+            ts_unix_ms: ts,
+            ts_iso: iso8601_from_unix_ms(ts),
+            prev: g.prev.clone(),
+            event: event.clone(),
+            hash: hash.clone(),
+        };
+        let mut line = serde_json::to_string(&rec).map_err(|e| VerifierError::Audit(e.to_string()))?;
+        line.push('\n');
+        g.file.write_all(line.as_bytes()).map_err(|e| VerifierError::Audit(e.to_string()))?;
+        g.file.sync_all().map_err(|e| VerifierError::Audit(e.to_string()))?;
+        g.seq += 1;
+        g.prev = hash;
+        Ok(())
+    }
+}
+
+/// In-memory sink for tests; can be told to fail to exercise fail-closed paths.
+#[derive(Default)]
+pub struct MemoryAuditSink {
+    events: Mutex<Vec<AuditEvent>>,
+    fail: AtomicBool,
+}
+
+impl MemoryAuditSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn set_failing(&self, f: bool) {
+        self.fail.store(f, Ordering::SeqCst);
+    }
+    pub fn events(&self) -> Vec<AuditEvent> {
+        self.events.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+impl AuditSink for MemoryAuditSink {
+    fn append(&self, event: &AuditEvent) -> Result<()> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(VerifierError::Audit("simulated sink failure".into()));
+        }
+        lock(&self.events)?.push(event.clone());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::ManualClock;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("qib_audit_{}_{}_{name}.log", std::process::id(), line!()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn civil_dates_are_correct() {
+        // v17's approximation produced 2026-11-22 for this instant.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20_761), (2026, 11, 4));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29)); // leap day
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(iso8601_from_unix_ms(1_793_750_400_000 + 3_723_004), "2026-11-04T01:02:03.004Z");
+    }
+
+    #[test]
+    fn chain_verifies_and_resumes_across_reopen() {
+        let p = tmp("resume");
+        let clock = Arc::new(ManualClock::new(1_793_750_400_000));
+        {
+            let s = FileAuditSink::open(&p, clock.clone()).unwrap();
+            s.append(&AuditEvent::HumanReset { operator: "alice".into() }).unwrap();
+            s.append(&AuditEvent::BreakerTripped { reason: "x".into() }).unwrap();
+        }
+        assert_eq!(verify_chain(&p).unwrap(), 2);
+        {
+            let s = FileAuditSink::open(&p, clock).unwrap();
+            s.append(&AuditEvent::ChaosChanged { source: "drift".into(), active: true }).unwrap();
+        }
+        assert_eq!(verify_chain(&p).unwrap(), 3);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn tampering_is_detected_and_refuses_open() {
+        let p = tmp("tamper");
+        let clock = Arc::new(ManualClock::new(1_793_750_400_000));
+        {
+            let s = FileAuditSink::open(&p, clock.clone()).unwrap();
+            for i in 0..4 {
+                s.append(&AuditEvent::HumanReset { operator: format!("op{i}") }).unwrap();
+            }
+        }
+        let text = std::fs::read_to_string(&p).unwrap();
+
+        // 1. edit a field
+        std::fs::write(&p, text.replace("op1", "mallory")).unwrap();
+        assert!(verify_chain(&p).is_err());
+        assert!(FileAuditSink::open(&p, clock.clone()).is_err());
+
+        // 2. delete a record
+        let lines: Vec<&str> = text.lines().collect();
+        std::fs::write(&p, format!("{}\n{}\n{}\n", lines[0], lines[2], lines[3])).unwrap();
+        assert!(verify_chain(&p).is_err());
+
+        // 3. reorder records
+        std::fs::write(&p, format!("{}\n{}\n{}\n{}\n", lines[0], lines[2], lines[1], lines[3])).unwrap();
+        assert!(verify_chain(&p).is_err());
+
+        // untouched original is fine
+        std::fs::write(&p, &text).unwrap();
+        assert_eq!(verify_chain(&p).unwrap(), 4);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn concurrent_appends_are_never_dropped() {
+        let p = tmp("conc");
+        let clock = Arc::new(ManualClock::new(1_793_750_400_000));
+        let s = Arc::new(FileAuditSink::open(&p, clock).unwrap());
+        let hs: Vec<_> = (0..8)
+            .map(|t| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for i in 0..10 {
+                        s.append(&AuditEvent::HumanReset { operator: format!("t{t}-{i}") }).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(verify_chain(&p).unwrap(), 80);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn float_events_round_trip_through_the_chain() {
+        let p = tmp("float");
+        let clock = Arc::new(ManualClock::new(1_793_750_400_000));
+        let s = FileAuditSink::open(&p, clock).unwrap();
+        s.append(&AuditEvent::DriftEarlyEscalation { ewma_delta: 0.123456789012345, mean_std: 0.1 + 0.2 }).unwrap();
+        assert_eq!(verify_chain(&p).unwrap(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+}
+EOF
+cat > src/sentinel.rs <<'EOF'
+//! IMP-Q: sentinel probe integrity.
+//!
+//! Fixes vs v17:
+//! * The probe-pass test was `actual >= (concurrency as f64 * 0.0) || ...`,
+//!   i.e. `actual >= 0.0`: every probe "passed" and nothing was ever quarantined.
+//! * Probes are authenticated with **Ed25519**. The verifier holds only the
+//!   public key, so neither the verifier nor the AI controller process can forge a
+//!   probe (v17's shared-secret HMAC key lived in the same process as the AI).
+//! * Replay protection: timestamp freshness window + bounded nonce cache.
+//! * There is no unsigned path that can quarantine a link.
+use crate::errors::{lock, Result, VerifierError};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+const DOMAIN: &[u8] = b"QIB-PROBE-v1";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignedProbe {
+    pub src: String,
+    pub dst: String,
+    pub actual_fidelity: f64,
+    pub nonce: u64,
+    pub timestamp_ms: u64,
+    pub signature: [u8; 64],
+}
+
+fn signing_bytes(src: &str, dst: &str, fidelity: f64, nonce: u64, ts: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(DOMAIN.len() + src.len() + dst.len() + 40);
+    b.extend_from_slice(DOMAIN);
+    // Length-prefix variable fields so ("ab","c") can never equal ("a","bc").
+    b.extend_from_slice(&(src.len() as u32).to_le_bytes());
+    b.extend_from_slice(src.as_bytes());
+    b.extend_from_slice(&(dst.len() as u32).to_le_bytes());
+    b.extend_from_slice(dst.as_bytes());
+    b.extend_from_slice(&fidelity.to_bits().to_le_bytes());
+    b.extend_from_slice(&nonce.to_le_bytes());
+    b.extend_from_slice(&ts.to_le_bytes());
+    b
+}
+
+impl SignedProbe {
+    /// Used by the probe agent (which holds the private key) and by tests.
+    pub fn sign(sk: &SigningKey, src: &str, dst: &str, fidelity: f64, nonce: u64, timestamp_ms: u64) -> Self {
+        let sig = sk.sign(&signing_bytes(src, dst, fidelity, nonce, timestamp_ms));
+        Self {
+            src: src.to_owned(),
+            dst: dst.to_owned(),
+            actual_fidelity: fidelity,
+            nonce,
+            timestamp_ms,
+            signature: sig.to_bytes(),
+        }
+    }
+}
+
+pub struct ProbeVerifier {
+    key: VerifyingKey,
+    seen: Mutex<HashMap<u64, u64>>, // nonce -> timestamp_ms
+}
+
+impl ProbeVerifier {
+    pub fn new(key: VerifyingKey) -> Self {
+        Self { key, seen: Mutex::new(HashMap::new()) }
+    }
+
+    /// Authenticate and de-duplicate a probe. Any failure is an `Err`; the
+    /// caller must not act on a probe that fails here.
+    pub fn verify(&self, p: &SignedProbe, now_unix_ms: u64, max_age_ms: u64, nonce_capacity: usize) -> Result<()> {
+        if !(p.actual_fidelity.is_finite() && (0.0..=1.0).contains(&p.actual_fidelity)) {
+            return Err(VerifierError::ProbeRejected("fidelity out of range".into()));
+        }
+        let age = now_unix_ms.abs_diff(p.timestamp_ms);
+        if age > max_age_ms {
+            return Err(VerifierError::ProbeRejected(format!("stale or future-dated probe (skew {age} ms)")));
+        }
+        let sig = Signature::from_bytes(&p.signature);
+        let msg = signing_bytes(&p.src, &p.dst, p.actual_fidelity, p.nonce, p.timestamp_ms);
+        self.key
+            .verify_strict(&msg, &sig)
+            .map_err(|_| VerifierError::ProbeRejected("bad signature".into()))?;
+
+        let mut seen = lock(&self.seen)?;
+        // Entries older than the freshness window can never be replayed (they'd
+        // fail the age check), so they are safe to evict.
+        seen.retain(|_, ts| now_unix_ms.abs_diff(*ts) <= max_age_ms);
+        if seen.contains_key(&p.nonce) {
+            return Err(VerifierError::ProbeRejected("replayed nonce".into()));
+        }
+        if seen.len() >= nonce_capacity {
+            // Fail closed rather than evict a live nonce and open a replay window.
+            return Err(VerifierError::ProbeRejected("nonce cache full".into()));
+        }
+        seen.insert(p.nonce, p.timestamp_ms);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sk(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+    const NOW: u64 = 1_793_750_400_000;
+    const AGE: u64 = 30_000;
+
+    fn pv() -> ProbeVerifier {
+        ProbeVerifier::new(sk(1).verifying_key())
+    }
+
+    #[test]
+    fn valid_probe_passes_once() {
+        let v = pv();
+        let p = SignedProbe::sign(&sk(1), "A", "B", 0.5, 7, NOW);
+        v.verify(&p, NOW, AGE, 100).unwrap();
+        // replay
+        assert!(matches!(v.verify(&p, NOW, AGE, 100), Err(VerifierError::ProbeRejected(m)) if m.contains("replay")));
+    }
+
+    #[test]
+    fn wrong_key_is_rejected() {
+        let p = SignedProbe::sign(&sk(2), "A", "B", 0.5, 1, NOW);
+        assert!(pv().verify(&p, NOW, AGE, 100).is_err());
+    }
+
+    #[test]
+    fn every_signed_field_is_tamper_evident() {
+        let v = pv();
+        let good = SignedProbe::sign(&sk(1), "A", "B", 0.5, 1, NOW);
+        let mut n = 10u64;
+        let mut check = |mut p: SignedProbe| {
+            n += 1;
+            p.nonce = if p.nonce == good.nonce { p.nonce } else { p.nonce }; // keep tampered nonce as-is
+            assert!(v.verify(&p, NOW, AGE, 100).is_err(), "tampered probe accepted");
+        };
+        check(SignedProbe { actual_fidelity: 0.99, ..good.clone() });
+        check(SignedProbe { src: "Z".into(), ..good.clone() });
+        check(SignedProbe { dst: "Z".into(), ..good.clone() });
+        check(SignedProbe { nonce: 2, ..good.clone() });
+        check(SignedProbe { timestamp_ms: NOW + 1, ..good.clone() });
+        let mut s = good.clone();
+        s.signature[0] ^= 1;
+        check(s);
+        // and the untouched probe still verifies afterwards
+        v.verify(&good, NOW, AGE, 100).unwrap();
+    }
+
+    #[test]
+    fn field_boundary_ambiguity_is_closed() {
+        let v = pv();
+        let p = SignedProbe::sign(&sk(1), "ab", "c", 0.5, 1, NOW);
+        let forged = SignedProbe { src: "a".into(), dst: "bc".into(), ..p };
+        assert!(v.verify(&forged, NOW, AGE, 100).is_err());
+    }
+
+    #[test]
+    fn stale_and_future_probes_rejected() {
+        let v = pv();
+        let old = SignedProbe::sign(&sk(1), "A", "B", 0.5, 1, NOW - AGE - 1);
+        let future = SignedProbe::sign(&sk(1), "A", "B", 0.5, 2, NOW + AGE + 1);
+        let edge = SignedProbe::sign(&sk(1), "A", "B", 0.5, 3, NOW - AGE);
+        assert!(v.verify(&old, NOW, AGE, 100).is_err());
+        assert!(v.verify(&future, NOW, AGE, 100).is_err());
+        assert!(v.verify(&edge, NOW, AGE, 100).is_ok());
+    }
+
+    #[test]
+    fn out_of_range_fidelity_rejected_even_if_signed() {
+        let v = pv();
+        for (i, bad) in [f64::NAN, -0.1, 1.1, f64::INFINITY].into_iter().enumerate() {
+            let p = SignedProbe::sign(&sk(1), "A", "B", bad, i as u64, NOW);
+            assert!(v.verify(&p, NOW, AGE, 100).is_err());
+        }
+    }
+
+    #[test]
+    fn nonce_cache_fails_closed_when_full_and_recovers_after_expiry() {
+        let v = pv();
+        for i in 0..3 {
+            v.verify(&SignedProbe::sign(&sk(1), "A", "B", 0.5, i, NOW), NOW, AGE, 3).unwrap();
+        }
+        let p = SignedProbe::sign(&sk(1), "A", "B", 0.5, 99, NOW);
+        assert!(matches!(v.verify(&p, NOW, AGE, 3), Err(VerifierError::ProbeRejected(m)) if m.contains("full")));
+        // later, old nonces have aged out of the window and been evicted
+        let later = NOW + AGE * 3;
+        let p2 = SignedProbe::sign(&sk(1), "A", "B", 0.5, 100, later);
+        v.verify(&p2, later, AGE, 3).unwrap();
+    }
+}
+EOF
+echo ok
+
+Response:
+
+{"returncode":0,"stdout":"ok\n","stderr":""}
