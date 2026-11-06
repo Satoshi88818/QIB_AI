@@ -1,0 +1,5 @@
+cd /home/squire/qib && python3 /tmp/mutate.py M6 M7 M8 M9 M10 2>&1 | tail -12
+
+Response:
+
+{"returncode":0,"stdout":"M6 quarantine no longer forces INFINITY: KILLED (2 failing: quarantined_is_always_infinite, cache_hit_is_revalidated_even_if_the_version_was_not_bumped)\nM7 std collapses as 1/sqrt(n) (v17 semantics): KILLED (6 failing: config_reload_is_validated_audited_and_changes_behaviour, conservative_mode_tightens_and_invalidates_cache, health_is_read_only_and_reflects_reality…)\nM8 breaker latch removed from advance(): KILLED (1 failing: breaker_is_a_one_way_latch_until_operator_reset)\nM9 audit hash ignores event body: KILLED (1 failing: tampering_is_detected_and_refuses_open)\nM10 probe nonce replay check removed: KILLED (2 failing: forged_tampered_stale_and_replayed_probes_cannot_quarantine, valid_probe_passes_once)\n","stderr":""}
