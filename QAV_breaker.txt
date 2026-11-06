@@ -1,0 +1,892 @@
+cd /home/squire/qib
+cat > src/breaker.rs <<'EOF'
+//! IMP-S/T/T+: chaos throttle, circuit breaker, diversity breaker, escalation
+//! ladder and conservative mode, all in ONE mutex-guarded state so every reader
+//! sees a consistent snapshot (`SafetyView`).
+//!
+//! Invariants (mirrored in `formal/CalibrationInvariants.tla`):
+//!  * `stage == 4  <=>  !ai_enabled`                      (tripped = safe mode)
+//!  * `stage >= 3  =>  conservative`
+//!  * `!ai_enabled` is a one-way latch: only `operator_reset` clears it, and it
+//!    audits first and refuses to act if the audit write fails.
+//!  * the escalation ladder is driven in Rust; stage 2 raises a *request* for a
+//!    full-mesh probe that the prober consumes (v17 depended on a Python poll loop).
+use crate::audit::{AuditEvent, AuditSink};
+use crate::config::*;
+use crate::errors::{lock, Result, VerifierError};
+use crate::twin::LinkId;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChaosSource {
+    Spike = 1,
+    Drift = 2,
+    Operator = 4,
+}
+
+impl ChaosSource {
+    fn name(self) -> &'static str {
+        match self {
+            ChaosSource::Spike => "uncertainty_spike",
+            ChaosSource::Drift => "drift_overconfidence",
+            ChaosSource::Operator => "operator",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SafetyView {
+    pub ai_enabled: bool,
+    pub stage: u64,
+    pub conservative: bool,
+    pub chaos: bool,
+    pub learning_rate: f64,
+    /// Bumped on every change that can alter routing legality.
+    pub version: u64,
+}
+
+struct State {
+    ai_enabled: bool,
+    stage: u64,
+    conservative: bool,
+    chaos: u8,
+    consecutive: u64,
+    window_start: Option<u64>,
+    window_critical: bool,
+    critical_links: HashSet<LinkId>,
+    mesh_probe_requested: bool,
+    prev_global_std: Option<f64>,
+    version: u64,
+}
+
+impl State {
+    fn new() -> Self {
+        Self {
+            ai_enabled: true,
+            stage: 0,
+            conservative: false,
+            chaos: 0,
+            consecutive: 0,
+            window_start: None,
+            window_critical: false,
+            critical_links: HashSet::new(),
+            mesh_probe_requested: false,
+            prev_global_std: None,
+            version: 0,
+        }
+    }
+
+    fn trip(&mut self, reason: &str, ev: &mut Vec<AuditEvent>) {
+        if !self.ai_enabled {
+            return;
+        }
+        let from = self.stage;
+        self.ai_enabled = false;
+        self.stage = 4;
+        self.conservative = true;
+        self.version += 1;
+        ev.push(AuditEvent::BreakerTripped { reason: reason.to_owned() });
+        ev.push(AuditEvent::EscalationStageChanged { from, to: 4, reason: reason.to_owned() });
+    }
+
+    fn advance(&mut self, reason: &str, ev: &mut Vec<AuditEvent>) -> bool {
+        if !self.ai_enabled {
+            return false;
+        }
+        let to = self.stage + 1;
+        if to >= 4 {
+            self.trip(reason, ev);
+            return true;
+        }
+        let from = self.stage;
+        self.stage = to;
+        if to == 2 {
+            self.mesh_probe_requested = true;
+        }
+        if to >= 3 {
+            self.conservative = true;
+        }
+        self.version += 1;
+        ev.push(AuditEvent::EscalationStageChanged { from, to, reason: reason.to_owned() });
+        true
+    }
+
+    fn roll(&mut self, now_ns: u64, ev: &mut Vec<AuditEvent>) {
+        let start = match self.window_start {
+            None => {
+                self.window_start = Some(now_ns);
+                return;
+            }
+            Some(s) => s,
+        };
+        let elapsed = now_ns.saturating_sub(start);
+        if elapsed < CRITICAL_WINDOW_NS {
+            return;
+        }
+        let windows = elapsed / CRITICAL_WINDOW_NS;
+        // Finalise the window that just ended.
+        if self.window_critical {
+            self.consecutive += 1;
+        } else {
+            self.consecutive = 0;
+        }
+        if self.consecutive >= CRITICAL_CONSECUTIVE_WINDOWS {
+            self.trip("consecutive critical windows", ev);
+        }
+        // Any fully idle windows in between are non-critical.
+        if windows > 1 {
+            self.consecutive = 0;
+        }
+        self.window_critical = false;
+        self.critical_links.clear();
+        self.window_start = Some(start + windows * CRITICAL_WINDOW_NS);
+    }
+
+    fn view(&self) -> SafetyView {
+        let chaos = self.chaos != 0;
+        SafetyView {
+            ai_enabled: self.ai_enabled,
+            stage: self.stage,
+            conservative: self.conservative,
+            chaos,
+            learning_rate: if chaos { LEARNING_RATE_THROTTLED } else { LEARNING_RATE_NORMAL },
+            version: self.version,
+        }
+    }
+}
+
+pub struct SafetyState {
+    st: Mutex<State>,
+    audit: Arc<dyn AuditSink>,
+    audit_failures: AtomicU64,
+    diversity_trips: AtomicU64,
+}
+
+impl SafetyState {
+    pub fn new(audit: Arc<dyn AuditSink>) -> Self {
+        Self { st: Mutex::new(State::new()), audit, audit_failures: AtomicU64::new(0), diversity_trips: AtomicU64::new(0) }
+    }
+
+    /// Emit events *after* the state lock is released. A failed audit write never
+    /// blocks a safety transition (the transition already happened); it is counted
+    /// and surfaced in health/metrics.
+    fn emit(&self, events: Vec<AuditEvent>) {
+        for e in events {
+            if self.audit.append(&e).is_err() {
+                self.audit_failures.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    pub fn audit_failures(&self) -> u64 {
+        self.audit_failures.load(Ordering::SeqCst)
+    }
+    pub fn diversity_trips(&self) -> u64 {
+        self.diversity_trips.load(Ordering::SeqCst)
+    }
+
+    pub fn view(&self) -> Result<SafetyView> {
+        Ok(lock(&self.st)?.view())
+    }
+
+    pub fn bump_version(&self) -> Result<()> {
+        lock(&self.st)?.version += 1;
+        Ok(())
+    }
+
+    /// IMP-T / IMP-T+: feed one reality delta. Non-finite deltas count as critical.
+    pub fn record_reality_delta(&self, link: &LinkId, delta: f64, now_ns: u64, cfg: &RuntimeConfig) -> Result<()> {
+        let mut ev = Vec::new();
+        {
+            let mut st = lock(&self.st)?;
+            if !st.ai_enabled {
+                return Ok(()); // latched; nothing can re-enable except operator_reset
+            }
+            st.roll(now_ns, &mut ev);
+            if !st.ai_enabled {
+                drop(st);
+                self.emit(ev);
+                return Ok(());
+            }
+            let critical = !delta.is_finite() || delta > cfg.critical_delta_threshold;
+            if critical {
+                st.window_critical = true;
+                st.critical_links.insert(link.clone());
+                if st.critical_links.len() >= cfg.diversity_link_threshold {
+                    self.diversity_trips.fetch_add(1, Ordering::SeqCst);
+                    st.trip("diversity breaker: correlated multi-link failure", &mut ev);
+                }
+            }
+        }
+        self.emit(ev);
+        Ok(())
+    }
+
+    /// Roll windows with no new data (call periodically).
+    pub fn tick(&self, now_ns: u64) -> Result<()> {
+        let mut ev = Vec::new();
+        lock(&self.st)?.roll(now_ns, &mut ev);
+        self.emit(ev);
+        Ok(())
+    }
+
+    /// Escalate one stage (used by the drift detector). Returns whether it moved.
+    pub fn advance_stage(&self, reason: &str) -> Result<bool> {
+        let mut ev = Vec::new();
+        let moved = lock(&self.st)?.advance(reason, &mut ev);
+        self.emit(ev);
+        Ok(moved)
+    }
+
+    /// Set or clear one chaos source. Chaos = OR of sources, so one source
+    /// recovering cannot silently cancel another (v17's throttle was latched).
+    pub fn set_chaos_source(&self, src: ChaosSource, active: bool) -> Result<bool> {
+        let mut changed = false;
+        {
+            let mut st = lock(&self.st)?;
+            let bit = src as u8;
+            let was = st.chaos & bit != 0;
+            if was != active {
+                if active {
+                    st.chaos |= bit;
+                } else {
+                    st.chaos &= !bit;
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.emit(vec![AuditEvent::ChaosChanged { source: src.name().into(), active }]);
+        }
+        Ok(changed)
+    }
+
+    /// Global-uncertainty spike (IMP-T+): if the mean std rose by more than the
+    /// threshold since the previous sample, raise chaos; clear when it stops rising.
+    pub fn observe_global_uncertainty(&self, avg_std: f64, spike_threshold: f64) -> Result<bool> {
+        let spike = {
+            let mut st = lock(&self.st)?;
+            let spike = st.prev_global_std.map_or(false, |p| avg_std - p > spike_threshold);
+            st.prev_global_std = Some(avg_std);
+            spike
+        };
+        self.set_chaos_source(ChaosSource::Spike, spike)?;
+        Ok(spike)
+    }
+
+    pub fn take_mesh_probe_request(&self) -> Result<bool> {
+        let mut st = lock(&self.st)?;
+        Ok(std::mem::replace(&mut st.mesh_probe_requested, false))
+    }
+
+    // ── Operator actions: audit FIRST, refuse if the audit write fails ────────
+
+    pub fn operator_reset(&self, operator: &str) -> Result<()> {
+        self.audit.append(&AuditEvent::HumanReset { operator: operator.to_owned() })?;
+        let mut st = lock(&self.st)?;
+        let version = st.version + 1;
+        *st = State::new();
+        st.version = version;
+        Ok(())
+    }
+
+    pub fn operator_set_conservative(&self, active: bool, operator: &str) -> Result<()> {
+        {
+            let st = lock(&self.st)?;
+            if !active && st.stage >= 3 {
+                return Err(VerifierError::Config(
+                    "cannot disable conservative mode while escalated (stage >= 3); reset the breaker instead".into(),
+                ));
+            }
+        }
+        self.audit.append(&AuditEvent::ConservativeModeChanged { active, operator: operator.to_owned() })?;
+        let mut st = lock(&self.st)?;
+        if st.conservative != active {
+            st.conservative = active;
+            st.version += 1;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::MemoryAuditSink;
+
+    const W: u64 = CRITICAL_WINDOW_NS;
+
+    fn mk() -> (SafetyState, Arc<MemoryAuditSink>, RuntimeConfig) {
+        let a = Arc::new(MemoryAuditSink::new());
+        (SafetyState::new(a.clone()), a, RuntimeConfig::default())
+    }
+    fn l(i: usize) -> LinkId {
+        LinkId::new("A", &format!("N{i}"))
+    }
+
+    #[test]
+    fn three_consecutive_critical_windows_trip() {
+        let (s, a, c) = mk();
+        s.record_reality_delta(&l(0), 0.9, 0, &c).unwrap();
+        s.record_reality_delta(&l(0), 0.9, W + 1, &c).unwrap();
+        s.record_reality_delta(&l(0), 0.9, 2 * W + 1, &c).unwrap();
+        assert!(s.view().unwrap().ai_enabled, "third window not yet finalised");
+        s.tick(3 * W + 1).unwrap();
+        let v = s.view().unwrap();
+        assert!(!v.ai_enabled && v.stage == 4 && v.conservative);
+        assert!(a.events().iter().any(|e| matches!(e, AuditEvent::BreakerTripped { .. })));
+    }
+
+    #[test]
+    fn healthy_window_resets_the_streak() {
+        let (s, _, c) = mk();
+        s.record_reality_delta(&l(0), 0.9, 0, &c).unwrap();
+        s.record_reality_delta(&l(0), 0.9, W + 1, &c).unwrap();
+        s.record_reality_delta(&l(0), 0.01, 2 * W + 1, &c).unwrap(); // healthy window
+        s.record_reality_delta(&l(0), 0.9, 3 * W + 1, &c).unwrap();
+        s.record_reality_delta(&l(0), 0.9, 4 * W + 1, &c).unwrap();
+        s.tick(5 * W + 1).unwrap();
+        assert!(s.view().unwrap().ai_enabled);
+    }
+
+    #[test]
+    fn idle_gap_breaks_the_streak() {
+        let (s, _, c) = mk();
+        s.record_reality_delta(&l(0), 0.9, 0, &c).unwrap();
+        s.record_reality_delta(&l(0), 0.9, W + 1, &c).unwrap();
+        s.tick(6 * W).unwrap(); // several empty windows
+        s.record_reality_delta(&l(0), 0.9, 6 * W + 1, &c).unwrap();
+        s.tick(7 * W + 5).unwrap();
+        assert!(s.view().unwrap().ai_enabled);
+    }
+
+    #[test]
+    fn diversity_breaker_trips_on_distinct_links_only() {
+        let (s, _, c) = mk();
+        for _ in 0..20 {
+            s.record_reality_delta(&l(0), 0.9, 10, &c).unwrap(); // same link repeatedly
+        }
+        assert!(s.view().unwrap().ai_enabled);
+        for i in 1..c.diversity_link_threshold {
+            s.record_reality_delta(&l(i), 0.9, 10, &c).unwrap();
+        }
+        assert!(!s.view().unwrap().ai_enabled);
+        assert_eq!(s.diversity_trips(), 1);
+    }
+
+    #[test]
+    fn non_finite_delta_counts_as_critical() {
+        let (s, _, c) = mk();
+        for i in 0..c.diversity_link_threshold {
+            s.record_reality_delta(&l(i), f64::NAN, 10, &c).unwrap();
+        }
+        assert!(!s.view().unwrap().ai_enabled);
+    }
+
+    #[test]
+    fn breaker_is_a_one_way_latch_until_operator_reset() {
+        let (s, a, c) = mk();
+        for i in 0..c.diversity_link_threshold {
+            s.record_reality_delta(&l(i), 0.9, 10, &c).unwrap();
+        }
+        assert!(!s.view().unwrap().ai_enabled);
+        // healthy data, time passing, drift de-escalation: still disabled
+        for t in 1..20u64 {
+            s.record_reality_delta(&l(0), 0.0, t * W, &c).unwrap();
+            s.tick(t * W + 1).unwrap();
+            assert!(!s.advance_stage("x").unwrap());
+            assert!(!s.view().unwrap().ai_enabled);
+        }
+        let v0 = s.view().unwrap().version;
+        s.operator_reset("alice").unwrap();
+        let v = s.view().unwrap();
+        assert!(v.ai_enabled && v.stage == 0 && !v.conservative);
+        assert!(v.version > v0);
+        assert!(a.events().contains(&AuditEvent::HumanReset { operator: "alice".into() }));
+    }
+
+    #[test]
+    fn reset_fails_closed_when_audit_is_down() {
+        let (s, a, c) = mk();
+        for i in 0..c.diversity_link_threshold {
+            s.record_reality_delta(&l(i), 0.9, 10, &c).unwrap();
+        }
+        a.set_failing(true);
+        assert!(matches!(s.operator_reset("alice"), Err(VerifierError::Audit(_))));
+        assert!(!s.view().unwrap().ai_enabled, "un-audited reset must not re-enable the AI");
+        a.set_failing(false);
+        s.operator_reset("alice").unwrap();
+        assert!(s.view().unwrap().ai_enabled);
+    }
+
+    #[test]
+    fn audit_outage_never_blocks_a_trip_but_is_counted() {
+        let (s, a, c) = mk();
+        a.set_failing(true);
+        for i in 0..c.diversity_link_threshold {
+            s.record_reality_delta(&l(i), 0.9, 10, &c).unwrap();
+        }
+        assert!(!s.view().unwrap().ai_enabled);
+        assert!(s.audit_failures() > 0);
+    }
+
+    #[test]
+    fn escalation_ladder_semantics() {
+        let (s, _, _) = mk();
+        assert!(s.advance_stage("t").unwrap()); // 1
+        assert!(!s.take_mesh_probe_request().unwrap());
+        assert!(s.advance_stage("t").unwrap()); // 2 -> mesh probe request
+        assert!(s.take_mesh_probe_request().unwrap());
+        assert!(!s.take_mesh_probe_request().unwrap(), "request is consumed once");
+        assert!(!s.view().unwrap().conservative);
+        assert!(s.advance_stage("t").unwrap()); // 3 -> conservative
+        let v = s.view().unwrap();
+        assert!(v.stage == 3 && v.conservative && v.ai_enabled);
+        assert!(s.advance_stage("t").unwrap()); // 4 -> trip
+        let v = s.view().unwrap();
+        assert!(v.stage == 4 && !v.ai_enabled);
+    }
+
+    #[test]
+    fn stage_invariants_hold_through_any_sequence() {
+        let (s, _, _) = mk();
+        for _ in 0..8 {
+            s.advance_stage("t").unwrap();
+            let v = s.view().unwrap();
+            assert_eq!(v.stage == 4, !v.ai_enabled);
+            if v.stage >= 3 {
+                assert!(v.conservative);
+            }
+        }
+    }
+
+    #[test]
+    fn conservative_cannot_be_dropped_while_escalated() {
+        let (s, _, _) = mk();
+        s.operator_set_conservative(true, "bob").unwrap();
+        s.operator_set_conservative(false, "bob").unwrap();
+        for _ in 0..3 {
+            s.advance_stage("t").unwrap();
+        }
+        assert!(s.operator_set_conservative(false, "bob").is_err());
+        assert!(s.view().unwrap().conservative);
+    }
+
+    #[test]
+    fn chaos_is_an_or_of_sources_and_is_reversible() {
+        let (s, _, _) = mk();
+        assert_eq!(s.view().unwrap().learning_rate, LEARNING_RATE_NORMAL);
+        s.set_chaos_source(ChaosSource::Drift, true).unwrap();
+        s.set_chaos_source(ChaosSource::Spike, true).unwrap();
+        assert_eq!(s.view().unwrap().learning_rate, LEARNING_RATE_THROTTLED);
+        s.set_chaos_source(ChaosSource::Spike, false).unwrap();
+        assert!(s.view().unwrap().chaos, "drift source still active");
+        s.set_chaos_source(ChaosSource::Drift, false).unwrap();
+        assert_eq!(s.view().unwrap().learning_rate, LEARNING_RATE_NORMAL);
+    }
+
+    #[test]
+    fn uncertainty_spike_raises_and_clears_chaos() {
+        let (s, _, c) = mk();
+        let t = c.global_uncertainty_spike_threshold;
+        assert!(!s.observe_global_uncertainty(0.10, t).unwrap()); // first sample
+        assert!(s.observe_global_uncertainty(0.10 + t + 0.01, t).unwrap());
+        assert!(s.view().unwrap().chaos);
+        assert!(!s.observe_global_uncertainty(0.30, t).unwrap()); // stopped rising
+        assert!(!s.view().unwrap().chaos);
+    }
+}
+EOF
+cat > src/drift.rs <<'EOF'
+//! Pillar VIII (IMP-D): AI drift detector.
+//!
+//! Fixes vs v17:
+//! * EWMA is seeded with the first sample (v17 started at 0 and under-read).
+//! * No action before `drift_min_samples` (warm-up gate).
+//! * Early escalation has **hysteresis**: it fires once per excursion above the
+//!   threshold and re-arms only after the EWMA falls below `threshold * reset_ratio`
+//!   (v17 re-fired on every flap around the threshold).
+//! * "Overconfidence" uses the mean predictive std instead of differential
+//!   entropy, which is negative for any fidelity std < ~0.24 and made v17's
+//!   `entropy < 0.05` test almost always true.
+use crate::config::RuntimeConfig;
+use crate::errors::{lock, Result};
+use serde::Serialize;
+use std::sync::Mutex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct DriftReport {
+    pub ewma_delta: f64,
+    pub mean_std: f64,
+    pub overconfidence_detected: bool,
+    pub early_escalation_active: bool,
+    pub sample_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DriftAction {
+    /// True exactly once per excursion above the threshold.
+    pub early_escalate: bool,
+    /// Level-triggered: currently overconfident.
+    pub overconfident: bool,
+}
+
+struct Inner {
+    ewma: f64,
+    mean_std: f64,
+    count: u64,
+    armed: bool,
+    active: bool,
+    overconfident: bool,
+}
+
+impl Inner {
+    fn new() -> Self {
+        Self { ewma: 0.0, mean_std: 1.0, count: 0, armed: true, active: false, overconfident: false }
+    }
+}
+
+pub struct DriftDetector {
+    inner: Mutex<Inner>,
+}
+
+impl Default for DriftDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DriftDetector {
+    pub fn new() -> Self {
+        Self { inner: Mutex::new(Inner::new()) }
+    }
+
+    pub fn record(&self, delta: f64, mean_std: f64, cfg: &RuntimeConfig) -> Result<DriftAction> {
+        // Non-finite inputs are the worst case, not a reason to skip the sample.
+        let delta = if delta.is_finite() { delta.clamp(0.0, 1.0) } else { 1.0 };
+        let mean_std = if mean_std.is_finite() { mean_std.clamp(0.0, 1.0) } else { 1.0 };
+        let mut s = lock(&self.inner)?;
+        if s.count == 0 {
+            s.ewma = delta;
+        } else {
+            s.ewma += cfg.drift_ewma_alpha * (delta - s.ewma);
+        }
+        s.mean_std = mean_std;
+        s.count += 1;
+
+        let mut early = false;
+        if s.count >= cfg.drift_min_samples {
+            let thr = cfg.drift_escalation_threshold;
+            if s.ewma > thr && s.armed {
+                early = true;
+                s.armed = false;
+                s.active = true;
+            } else if s.ewma < thr * cfg.drift_reset_ratio {
+                s.armed = true;
+                s.active = false;
+            }
+            s.overconfident = mean_std < cfg.drift_overconfidence_std && s.ewma > thr * 0.5;
+        } else {
+            s.overconfident = false;
+        }
+        Ok(DriftAction { early_escalate: early, overconfident: s.overconfident })
+    }
+
+    pub fn report(&self) -> Result<DriftReport> {
+        let s = lock(&self.inner)?;
+        Ok(DriftReport {
+            ewma_delta: s.ewma,
+            mean_std: s.mean_std,
+            overconfidence_detected: s.overconfident,
+            early_escalation_active: s.active,
+            sample_count: s.count,
+        })
+    }
+
+    pub fn reset(&self) -> Result<()> {
+        *lock(&self.inner)? = Inner::new();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> RuntimeConfig {
+        RuntimeConfig { drift_min_samples: 5, ..Default::default() }
+    }
+
+    #[test]
+    fn first_sample_seeds_the_ewma() {
+        let d = DriftDetector::new();
+        d.record(0.5, 0.5, &cfg()).unwrap();
+        assert_eq!(d.report().unwrap().ewma_delta, 0.5);
+    }
+
+    #[test]
+    fn warm_up_gate_suppresses_action() {
+        let d = DriftDetector::new();
+        for _ in 0..4 {
+            let a = d.record(0.9, 0.001, &cfg()).unwrap();
+            assert!(!a.early_escalate && !a.overconfident);
+        }
+        assert!(d.record(0.9, 0.001, &cfg()).unwrap().early_escalate);
+    }
+
+    #[test]
+    fn early_escalation_fires_once_per_excursion_with_hysteresis() {
+        let d = DriftDetector::new();
+        let c = cfg();
+        let mut fires = 0;
+        for _ in 0..30 {
+            if d.record(0.9, 0.5, &c).unwrap().early_escalate {
+                fires += 1;
+            }
+        }
+        assert_eq!(fires, 1, "stays above threshold => single escalation");
+        // hover just under the threshold (inside the hysteresis band): must not re-arm
+        while d.report().unwrap().ewma_delta > c.drift_escalation_threshold * 0.95 {
+            d.record(0.0, 0.5, &c).unwrap();
+        }
+        assert!(d.report().unwrap().early_escalation_active, "still latched inside the band");
+        for _ in 0..3 {
+            let x = c.drift_escalation_threshold * 1.0;
+            assert!(!d.record(x, 0.5, &c).unwrap().early_escalate);
+        }
+        // fall well below => re-arms
+        for _ in 0..60 {
+            d.record(0.0, 0.5, &c).unwrap();
+        }
+        assert!(!d.report().unwrap().early_escalation_active);
+        let mut again = false;
+        for _ in 0..30 {
+            again |= d.record(0.9, 0.5, &c).unwrap().early_escalate;
+        }
+        assert!(again, "a fresh excursion escalates again");
+    }
+
+    #[test]
+    fn overconfidence_needs_low_std_and_elevated_error() {
+        let d = DriftDetector::new();
+        let c = cfg();
+        for _ in 0..20 {
+            d.record(0.0, 0.001, &c).unwrap(); // confident AND right
+        }
+        assert!(!d.report().unwrap().overconfidence_detected);
+        let d = DriftDetector::new();
+        for _ in 0..20 {
+            d.record(0.5, 0.5, &c).unwrap(); // wrong but humble
+        }
+        assert!(!d.report().unwrap().overconfidence_detected);
+        let d = DriftDetector::new();
+        let mut last = false;
+        for _ in 0..20 {
+            last = d.record(0.5, 0.001, &c).unwrap().overconfident; // wrong AND confident
+        }
+        assert!(last);
+    }
+
+    #[test]
+    fn non_finite_input_is_worst_case() {
+        let d = DriftDetector::new();
+        for _ in 0..10 {
+            d.record(f64::NAN, f64::NAN, &cfg()).unwrap();
+        }
+        let r = d.report().unwrap();
+        assert_eq!(r.ewma_delta, 1.0);
+        assert!(r.ewma_delta.is_finite() && r.mean_std.is_finite());
+    }
+
+    #[test]
+    fn reset_clears_everything() {
+        let d = DriftDetector::new();
+        for _ in 0..10 {
+            d.record(0.9, 0.001, &cfg()).unwrap();
+        }
+        d.reset().unwrap();
+        let r = d.report().unwrap();
+        assert_eq!((r.sample_count, r.ewma_delta), (0, 0.0));
+        assert!(!r.overconfidence_detected && !r.early_escalation_active);
+    }
+}
+EOF
+cat > src/zone.rs <<'EOF'
+//! Zone-level hierarchical quarantine.
+//!
+//! Fix vs v17: the trigger threshold came from `probe_sentinel_concurrency`
+//! (min'd with the zone constant). It now uses `zone_quarantine_link_threshold`.
+//! Triggering is idempotent (no repeated audit spam) and operator-liftable.
+use crate::errors::{lock, Result, VerifierError};
+use crate::twin::{LinkId, TwinStore};
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
+#[derive(Default)]
+struct Inner {
+    zones: HashMap<String, HashSet<LinkId>>,
+    link_zone: HashMap<LinkId, String>,
+    quarantined_zones: HashSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZoneTrigger {
+    pub zone: String,
+    /// Links that were newly quarantined by the zone action.
+    pub newly_quarantined: Vec<LinkId>,
+    pub zone_size: usize,
+}
+
+#[derive(Default)]
+pub struct ZoneRegistry {
+    inner: Mutex<Inner>,
+}
+
+impl ZoneRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_link(&self, link: &LinkId, zone: &str) -> Result<()> {
+        let mut g = lock(&self.inner)?;
+        if let Some(existing) = g.link_zone.get(link) {
+            if existing != zone {
+                return Err(VerifierError::Config(format!("{link} already belongs to zone {existing}")));
+            }
+            return Ok(());
+        }
+        g.link_zone.insert(link.clone(), zone.to_owned());
+        g.zones.entry(zone.to_owned()).or_default().insert(link.clone());
+        Ok(())
+    }
+
+    /// Lock order: registry mutex, then twin lock. The twin never calls back here.
+    pub fn on_link_quarantined(&self, twin: &TwinStore, link: &LinkId, threshold: usize) -> Result<Option<ZoneTrigger>> {
+        let mut g = lock(&self.inner)?;
+        let Some(zone) = g.link_zone.get(link).cloned() else { return Ok(None) };
+        if g.quarantined_zones.contains(&zone) {
+            return Ok(None);
+        }
+        let members: Vec<LinkId> = g.zones.get(&zone).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        let mut count = 0;
+        for m in &members {
+            if twin.is_quarantined(m)? {
+                count += 1;
+            }
+        }
+        if count < threshold {
+            return Ok(None);
+        }
+        let mut newly = Vec::new();
+        for m in &members {
+            if twin.set_quarantined(m, true, &format!("zone {zone} quarantined"))? {
+                newly.push(m.clone());
+            }
+        }
+        newly.sort();
+        g.quarantined_zones.insert(zone.clone());
+        Ok(Some(ZoneTrigger { zone, newly_quarantined: newly, zone_size: members.len() }))
+    }
+
+    /// Operator action: lift the zone quarantine and every member's quarantine.
+    pub fn lift_zone(&self, twin: &TwinStore, zone: &str) -> Result<Vec<LinkId>> {
+        let mut g = lock(&self.inner)?;
+        g.quarantined_zones.remove(zone);
+        let members: Vec<LinkId> = g.zones.get(zone).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        let mut lifted = Vec::new();
+        for m in members {
+            if twin.set_quarantined(&m, false, "")? {
+                lifted.push(m);
+            }
+        }
+        lifted.sort();
+        Ok(lifted)
+    }
+
+    pub fn list_zones(&self) -> Result<Vec<(String, usize, bool)>> {
+        let g = lock(&self.inner)?;
+        let mut v: Vec<_> =
+            g.zones.iter().map(|(z, s)| (z.clone(), s.len(), g.quarantined_zones.contains(z))).collect();
+        v.sort();
+        Ok(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> (ZoneRegistry, TwinStore, Vec<LinkId>) {
+        let z = ZoneRegistry::new();
+        let t = TwinStore::new();
+        let links: Vec<LinkId> = (0..4).map(|i| LinkId::new("R1", &format!("H{i}"))).collect();
+        for l in &links {
+            z.register_link(l, "rack1").unwrap();
+            t.observe(l, 0.95, 0.05, 100).unwrap();
+        }
+        (z, t, links)
+    }
+
+    #[test]
+    fn below_threshold_does_nothing() {
+        let (z, t, l) = setup();
+        t.set_quarantined(&l[0], true, "x").unwrap();
+        assert!(z.on_link_quarantined(&t, &l[0], 3).unwrap().is_none());
+        t.set_quarantined(&l[1], true, "x").unwrap();
+        assert!(z.on_link_quarantined(&t, &l[1], 3).unwrap().is_none());
+        assert!(!t.is_quarantined(&l[3]).unwrap());
+    }
+
+    #[test]
+    fn threshold_quarantines_whole_zone_once() {
+        let (z, t, l) = setup();
+        for i in 0..3 {
+            t.set_quarantined(&l[i], true, "x").unwrap();
+        }
+        let trig = z.on_link_quarantined(&t, &l[2], 3).unwrap().expect("zone should trigger");
+        assert_eq!(trig.newly_quarantined, vec![l[3].clone()]);
+        assert_eq!(trig.zone_size, 4);
+        assert!(l.iter().all(|x| t.is_quarantined(x).unwrap()));
+        // idempotent
+        assert!(z.on_link_quarantined(&t, &l[2], 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn threshold_is_not_capped_by_unrelated_settings() {
+        // Regression (v17): threshold was min(probe_concurrency, zone_threshold).
+        let (z, t, l) = setup();
+        for i in 0..2 {
+            t.set_quarantined(&l[i], true, "x").unwrap();
+        }
+        assert!(z.on_link_quarantined(&t, &l[1], 4).unwrap().is_none());
+    }
+
+    #[test]
+    fn unregistered_link_is_ignored_and_lift_works() {
+        let (z, t, l) = setup();
+        assert!(z.on_link_quarantined(&t, &LinkId::new("Q", "R"), 1).unwrap().is_none());
+        for x in l.iter().take(3) {
+            t.set_quarantined(x, true, "x").unwrap();
+        }
+        z.on_link_quarantined(&t, &l[0], 3).unwrap().unwrap();
+        let lifted = z.lift_zone(&t, "rack1").unwrap();
+        assert_eq!(lifted.len(), 4);
+        assert!(l.iter().all(|x| !t.is_quarantined(x).unwrap()));
+        assert_eq!(z.list_zones().unwrap(), vec![("rack1".to_string(), 4, false)]);
+    }
+
+    #[test]
+    fn link_cannot_be_in_two_zones() {
+        let (z, _, l) = setup();
+        assert!(z.register_link(&l[0], "rack2").is_err());
+        assert!(z.register_link(&l[0], "rack1").is_ok());
+    }
+}
+EOF
+echo ok
+
+Response:
+
+{"returncode":0,"stdout":"ok\n","stderr":""}
